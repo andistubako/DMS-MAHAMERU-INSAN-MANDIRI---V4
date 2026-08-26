@@ -171,6 +171,14 @@ export function getCurrentTimeFullWIB(d: Date = new Date()): string {
   return formatter.format(d);
 }
 
+export function getCurrentDayNameWIB(d: Date = new Date()): string {
+  const formatter = new Intl.DateTimeFormat("id-ID", {
+    timeZone: TIMEZONE_WIB,
+    weekday: "long",
+  });
+  return formatter.format(d);
+}
+
 export function formatDateTimeWIB(d: Date | string | number): string {
   if (!d) return "-";
   const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
@@ -2047,38 +2055,55 @@ apiRouter.delete("/company-profile/logo", authMiddleware, requireRoles("OWNER", 
 
 // ================= ATTENDANCE =================
 apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedRequest, res) => {
-  const { latitude, longitude, photo_in, mock_location, accuracy } = req.body || {};
+  const { latitude, longitude, photo_in, mock_location, accuracy, salesman_id: requestedSalesmanId } = req.body || {};
+
+  // 1. Identity & Impersonation Prevention
+  if (requestedSalesmanId && req.user!.role === "SALES" && requestedSalesmanId !== req.user!._id) {
+    return res.status(403).json({
+      detail: "Anda tidak memiliki izin untuk melakukan absensi atas nama pengguna lain.",
+      code: "FORBIDDEN_USER_IMPERSONATION",
+    });
+  }
+
+  const targetSalesmanId = req.user!.role === "SALES" ? req.user!._id : (requestedSalesmanId || req.user!._id);
+
+  // 2. GPS Coordinates Validation
   if (latitude == null || longitude == null) {
     return res.status(400).json({ detail: "Koordinat GPS (latitude & longitude) wajib diisi." });
   }
 
   const numLat = Number(latitude);
   const numLng = Number(longitude);
-  if (isNaN(numLat) || isNaN(numLng)) {
+  if (isNaN(numLat) || isNaN(numLng) || numLat < -90 || numLat > 90 || numLng < -180 || numLng > 180) {
     return res.status(400).json({ detail: "Koordinat GPS tidak valid." });
   }
 
+  // 3. Mock Location / Fake GPS Check
   if (mock_location && !db.settings.allow_fake_gps) {
-    return res.status(400).json({ detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang oleh sistem." });
-  }
-
-  // Check GPS accuracy if configured
-  const maxGpsAccuracy = (db.settings as any).gps_accuracy_max_m || 100;
-  if (accuracy != null && Number(accuracy) > maxGpsAccuracy) {
     return res.status(400).json({
-      detail: `Akurasi sinyal GPS terlalu rendah (${Math.round(accuracy)}m). Batas toleransi maksimum ${maxGpsAccuracy}m. Silakan tunggu sinyal GPS lebih stabil atau pindah ke area terbuka.`,
-      code: "LOW_GPS_ACCURACY",
+      detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang oleh sistem.",
+      code: "MOCK_LOCATION_DETECTED",
     });
   }
 
+  const now = new Date();
   const today = getTodayWIB();
-  const existing = db.attendance.find((a) => a.salesman_id === req.user!._id && a.date === today);
+
+  // 4. Duplicate Check-in Prevention
+  const existing = db.attendance.find((a) => a.salesman_id === targetSalesmanId && a.date === today);
   if (existing) {
-    return res.status(400).json({ detail: "Anda sudah melakukan absensi masuk hari ini.", attendance: existing });
+    return res.status(400).json({
+      detail: "Anda sudah melakukan absensi masuk hari ini.",
+      code: "DUPLICATE_CHECK_IN",
+      attendance: existing,
+    });
   }
 
-  // 1. BUSINESS RULE: Verify user's assigned office
-  const assignedOfficeId = req.user!.office_id;
+  // 5. Office Assignment Resolution
+  const targetUser = db.users.find((u) => u._id === targetSalesmanId);
+  const targetSalesman = db.salesmen.find((s) => s.user_id === targetSalesmanId || s._id === targetSalesmanId);
+  const assignedOfficeId = targetUser?.office_id || targetSalesman?.office_id || req.user!.office_id;
+
   if (!assignedOfficeId) {
     return res.status(400).json({
       detail: "Anda belum memiliki kantor penugasan yang aktif. Silakan hubungi Administrator atau Supervisor untuk mengatur kantor penugasan Anda.",
@@ -2101,11 +2126,58 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     });
   }
 
-  // 2. Calculate Distance to Assigned Office
-  const distanceToAssignedOffice = Math.round(haversineMeters(numLat, numLng, assignedOffice.latitude, assignedOffice.longitude));
-  const allowedRadius = (assignedOffice as any).attendance_radius || assignedOffice.radius_m || db.settings.max_geofence_m || 200;
+  // Optional: check if body specified an office_id that doesn't match assigned office
+  if (req.body?.office_id && req.body.office_id !== assignedOffice._id) {
+    return res.status(400).json({
+      detail: `Sales hanya dapat melakukan absensi di kantor penugasan yang ditentukan (${assignedOffice.office_name}).`,
+      code: "OFFICE_MISMATCH",
+    });
+  }
 
-  // 3. Geofence Rule: Sales MUST be within their assigned office radius
+  // 6. Verify Office Coordinates Configuration
+  const offLat = Number(assignedOffice.latitude);
+  const offLng = Number(assignedOffice.longitude);
+  if (
+    assignedOffice.latitude == null ||
+    assignedOffice.longitude == null ||
+    isNaN(offLat) ||
+    isNaN(offLng) ||
+    (offLat === 0 && offLng === 0)
+  ) {
+    return res.status(400).json({
+      detail: `Titik koordinat GPS kantor penugasan (${assignedOffice.office_name}) belum dikonfigurasi dengan benar oleh Administrator.`,
+      code: "OFFICE_COORDINATES_NOT_CONFIGURED",
+    });
+  }
+
+  // 7. GPS Accuracy Validation
+  const maxGpsAccuracy = Number((assignedOffice as any).gps_accuracy_max_m || (db.settings as any).gps_accuracy_max_m || 100);
+  if (accuracy != null && Number(accuracy) > maxGpsAccuracy) {
+    return res.status(400).json({
+      detail: `Akurasi sinyal GPS terlalu rendah (${Math.round(accuracy)}m). Batas toleransi maksimum ${maxGpsAccuracy}m. Silakan tunggu sinyal GPS lebih stabil atau pindah ke area terbuka.`,
+      code: "LOW_GPS_ACCURACY",
+      accuracy: Number(accuracy),
+      max_accuracy: maxGpsAccuracy,
+    });
+  }
+
+  // 8. Working Days Validation
+  const currentDay = getCurrentDayNameWIB(now);
+  const workingDays: string[] = (assignedOffice as any).working_days || (db.settings as any).working_days || ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+  const isWorkingDay = workingDays.some((d) => d.trim().toLowerCase() === currentDay.toLowerCase());
+  if (!isWorkingDay) {
+    return res.status(400).json({
+      detail: `Jadwal absensi tidak tersedia hari ini (${currentDay}). Kantor penugasan Anda (${assignedOffice.office_name}) libur pada hari ini.`,
+      code: "NOT_A_WORKING_DAY",
+      day: currentDay,
+      working_days: workingDays,
+    });
+  }
+
+  // 9. Geofence Distance Validation
+  const distanceToAssignedOffice = Math.round(haversineMeters(numLat, numLng, offLat, offLng));
+  const allowedRadius = Number((assignedOffice as any).attendance_radius || assignedOffice.radius_m || (db.settings as any).office_radius_m || (db.settings as any).max_geofence_m || 200);
+
   if (distanceToAssignedOffice > allowedRadius) {
     return res.status(400).json({
       detail: `Absensi masuk ditolak. Anda wajib melakukan absensi di kantor penugasan Anda: "${assignedOffice.office_name}". Jarak Anda saat ini: ${distanceToAssignedOffice}m (Maksimal radius yang diizinkan: ${allowedRadius}m).`,
@@ -2116,21 +2188,31 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     });
   }
 
-  // 4. Time & Shift Rules Check (in GMT+7 WIB)
-  const now = new Date();
+  // 10. Time & Shift Windows Check (in GMT+7 WIB)
   const workStartTime = (assignedOffice as any).work_start_time || (db.settings as any).work_start_time || "08:00";
   const workEndTime = (assignedOffice as any).work_end_time || (db.settings as any).work_end_time || "17:00";
   const checkInStart = (assignedOffice as any).check_in_start || (db.settings as any).check_in_start || "06:00";
+  const checkInEnd = (assignedOffice as any).check_in_end || (db.settings as any).check_in_end || "";
   const lateToleranceMin = Number((assignedOffice as any).late_tolerance_min ?? (db.settings as any).late_tolerance_min ?? 15);
 
   const currentTimeStr = getCurrentTimeHHMMWIB(now);
 
-  // Early check-in barrier check
+  // Early check-in barrier
   if (currentTimeStr < checkInStart) {
     return res.status(400).json({
-      detail: `Sistem absensi masuk baru dibuka pukul ${checkInStart} WIB. Waktu saat ini: ${currentTimeStr} WIB.`,
+      detail: `Sistem absensi masuk baru dibuka pukul ${checkInStart} WIB. Waktu server saat ini: ${currentTimeStr} WIB.`,
       code: "CHECK_IN_NOT_STARTED",
       check_in_start: checkInStart,
+      current_time: currentTimeStr,
+    });
+  }
+
+  // Check-in window closed check (if configured)
+  if (checkInEnd && currentTimeStr > checkInEnd) {
+    return res.status(400).json({
+      detail: `Batas waktu absensi masuk telah berakhir untuk hari ini (Pukul ${checkInEnd} WIB). Waktu server saat ini: ${currentTimeStr} WIB. Silakan hubungi Supervisor.`,
+      code: "CHECK_IN_CLOSED",
+      check_in_end: checkInEnd,
       current_time: currentTimeStr,
     });
   }
@@ -2138,8 +2220,8 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
   const lateInfo = calculateAttendanceLateStatus(currentTimeStr, workStartTime, lateToleranceMin);
 
   const newAtt: Attendance = {
-    _id: `att-${today}-${req.user!._id}`,
-    salesman_id: req.user!._id,
+    _id: `att-${today}-${targetSalesmanId}`,
+    salesman_id: targetSalesmanId,
     date: today,
     check_in_time: now.toISOString(),
     check_in_lat: numLat,
@@ -2153,19 +2235,19 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     early_leave_minutes: 0,
     overtime_minutes: 0,
     photo_in,
-    mock_location,
+    mock_location: !!mock_location,
   };
 
   db.attendance.push(newAtt);
 
   // Update user last location
-  const userObj = db.users.find((u) => u._id === req.user!._id);
-  if (userObj) {
-    userObj.last_location = {
+  if (targetUser) {
+    targetUser.last_location = {
       latitude: numLat,
       longitude: numLng,
       timestamp: now.toISOString(),
     };
+    syncSingleDoc("users", targetUser._id, targetUser);
   }
 
   // Audit Log
@@ -2175,8 +2257,8 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     "attendance",
     newAtt._id,
     {
-      salesman_id: req.user!._id,
-      salesman_name: req.user!.name,
+      salesman_id: targetSalesmanId,
+      salesman_name: targetUser?.name || req.user!.name,
       office_id: assignedOffice._id,
       office_name: assignedOffice.office_name,
       distance_m: distanceToAssignedOffice,
@@ -2195,7 +2277,7 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     ? `Terlambat ${newAtt.late_minutes} menit (Jam masuk: ${currentTimeStr} WIB, batas toleransi: ${lateInfo.thresholdTimeStr} WIB)`
     : `Tepat Waktu (Jam masuk: ${currentTimeStr} WIB)`;
 
-  res.status(201).json({
+  return res.status(201).json({
     message: `Absensi masuk berhasil di ${assignedOffice.office_name} — ${statusMsg}. Jarak ${distanceToAssignedOffice}m.`,
     attendance: {
       ...newAtt,
@@ -2207,23 +2289,68 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
 });
 
 apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedRequest, res) => {
-  const { latitude, longitude, photo_out, accuracy } = req.body || {};
+  const { latitude, longitude, photo_out, accuracy, force } = req.body || {};
   const today = getTodayWIB();
-  const att = db.attendance.find((a) => a.salesman_id === req.user!._id && a.date === today);
+  const targetSalesmanId = req.user!.role === "SALES" ? req.user!._id : (req.body?.salesman_id || req.user!._id);
+
+  const att = db.attendance.find((a) => a.salesman_id === targetSalesmanId && a.date === today);
 
   if (!att) {
-    return res.status(400).json({ detail: "Anda belum melakukan absensi masuk hari ini." });
+    return res.status(400).json({
+      detail: "Anda belum melakukan absensi masuk hari ini.",
+      code: "CHECK_IN_REQUIRED",
+    });
   }
   if (att.check_out_time) {
-    return res.status(400).json({ detail: "Anda sudah melakukan absensi keluar hari ini." });
+    return res.status(400).json({
+      detail: "Anda sudah melakukan absensi keluar hari ini.",
+      code: "ALREADY_CHECKED_OUT",
+      attendance: att,
+    });
   }
 
-  const activeVisit = db.visits.find((v) => v.salesman_id === req.user!._id && v.status === "IN_PROGRESS");
+  // Check for active visit in progress
+  const activeVisit = db.visits.find((v) => v.salesman_id === targetSalesmanId && v.status === "IN_PROGRESS");
   if (activeVisit) {
-    return res.status(400).json({ detail: "Selesaikan kunjungan outlet yang sedang berlangsung terlebih dahulu sebelum absen pulang." });
+    return res.status(400).json({
+      detail: "Selesaikan kunjungan outlet yang sedang berlangsung terlebih dahulu sebelum absen pulang.",
+      code: "ACTIVE_VISIT_IN_PROGRESS",
+      active_visit: activeVisit,
+    });
   }
 
   const now = new Date();
+  const currentTimeStr = getCurrentTimeHHMMWIB(now);
+
+  const assignedOffice = db.offices.find((o) => o._id === att.office_id) || db.offices.find((o) => o._id === req.user!.office_id);
+  const checkOutStart = (assignedOffice as any)?.check_out_start || (db.settings as any)?.check_out_start || "16:00";
+  const checkOutEnd = (assignedOffice as any)?.check_out_end || (db.settings as any)?.check_out_end || "";
+  const workEndTime = (assignedOffice as any)?.work_end_time || (db.settings as any)?.work_end_time || "17:00";
+
+  // Early checkout check (unless allowed by setting or force flag)
+  if (
+    currentTimeStr < checkOutStart &&
+    !db.settings.allow_early_checkout &&
+    force !== true &&
+    req.query.force !== "true"
+  ) {
+    return res.status(400).json({
+      detail: `Sistem absensi pulang baru dibuka pukul ${checkOutStart} WIB. Waktu server saat ini: ${currentTimeStr} WIB.`,
+      code: "CHECK_OUT_NOT_STARTED",
+      check_out_start: checkOutStart,
+      current_time: currentTimeStr,
+    });
+  }
+
+  if (checkOutEnd && currentTimeStr > checkOutEnd && force !== true) {
+    return res.status(400).json({
+      detail: `Batas waktu absensi pulang telah berakhir (Pukul ${checkOutEnd} WIB). Silakan hubungi Supervisor.`,
+      code: "CHECK_OUT_CLOSED",
+      check_out_end: checkOutEnd,
+      current_time: currentTimeStr,
+    });
+  }
+
   att.check_out_time = now.toISOString();
 
   // Compute work duration in seconds and formatted string
@@ -2232,13 +2359,9 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
   att.work_duration_seconds = durationSec;
   att.work_duration_formatted = formatSecondsToDuration(durationSec);
 
-  // Compute work shift finish / early leave / overtime
-  const assignedOffice = db.offices.find((o) => o._id === att.office_id) || db.offices.find((o) => o._id === req.user!.office_id);
-  const workEndTime = (assignedOffice as any)?.work_end_time || (db.settings as any)?.work_end_time || "17:00";
+  // Compute early leave or overtime
   att.scheduled_out = workEndTime;
-
-  const checkOutTimeStr = getCurrentTimeHHMMWIB(now);
-  const checkOutMin = parseTimeToMinutes(checkOutTimeStr);
+  const checkOutMin = parseTimeToMinutes(currentTimeStr);
   const workEndMin = parseTimeToMinutes(workEndTime);
 
   if (checkOutMin < workEndMin) {
@@ -2252,29 +2375,35 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
   if (latitude != null && longitude != null) {
     const numLat = Number(latitude);
     const numLng = Number(longitude);
-    att.check_out_lat = numLat;
-    att.check_out_lng = numLng;
+    if (!isNaN(numLat) && !isNaN(numLng)) {
+      att.check_out_lat = numLat;
+      att.check_out_lng = numLng;
 
-    if (assignedOffice) {
-      att.distance_out_m = Math.round(haversineMeters(numLat, numLng, assignedOffice.latitude, assignedOffice.longitude));
-    }
+      if (assignedOffice && assignedOffice.latitude != null && assignedOffice.longitude != null) {
+        att.distance_out_m = Math.round(
+          haversineMeters(numLat, numLng, Number(assignedOffice.latitude), Number(assignedOffice.longitude))
+        );
+      }
 
-    const userObj = db.users.find((u) => u._id === req.user!._id);
-    if (userObj) {
-      userObj.last_location = {
-        latitude: numLat,
-        longitude: numLng,
-        timestamp: now.toISOString(),
-      };
+      const targetUser = db.users.find((u) => u._id === targetSalesmanId);
+      if (targetUser) {
+        targetUser.last_location = {
+          latitude: numLat,
+          longitude: numLng,
+          timestamp: now.toISOString(),
+        };
+        syncSingleDoc("users", targetUser._id, targetUser);
+      }
     }
   }
+
   if (photo_out) att.photo_out = photo_out;
 
-  const cp = db.call_plans.find((p) => p.salesman_id === req.user!._id && p.date === today);
+  const cp = db.call_plans.find((p) => p.salesman_id === targetSalesmanId && p.date === today);
   const planned = cp ? db.call_plan_items.filter((i) => i.call_plan_id === cp._id).length : 0;
-  const kpi = calculateSalesKPIs({ salesmanId: req.user!._id, from: today, to: today });
+  const kpi = calculateSalesKPIs({ salesmanId: targetSalesmanId, from: today, to: today });
   const missed = Math.max(0, planned - kpi.outlet_calls);
-  const newOutlets = db.outlets.filter((o) => o.created_by === req.user!._id && o.created_at?.startsWith(today)).length;
+  const newOutlets = db.outlets.filter((o) => o.created_by === targetSalesmanId && o.created_at?.startsWith(today)).length;
 
   const summary = {
     check_in_time: att.check_in_time,
@@ -2306,7 +2435,7 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
     "attendance",
     att._id,
     {
-      salesman_id: req.user!._id,
+      salesman_id: targetSalesmanId,
       salesman_name: req.user!.name,
       office_id: att.office_id,
       distance_out_m: att.distance_out_m,
@@ -2318,43 +2447,69 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
 
   syncSingleDoc("attendance", att._id, att);
 
-  res.json({
+  return res.json({
     message: `Absensi keluar berhasil disimpan. Total durasi kerja: ${att.work_duration_formatted}. Terima kasih atas dedikasi Anda hari ini!`,
     attendance: att,
-    summary
+    summary,
   });
 });
 
 apiRouter.get("/attendance/today", authMiddleware, (req: AuthenticatedRequest, res) => {
   const today = getTodayWIB();
-  const att = db.attendance.find((a) => a.salesman_id === req.user!._id && a.date === today);
-  const assignedOffice = req.user?.office_id ? db.offices.find((o) => o._id === req.user!.office_id) : null;
+  const targetSalesmanId = req.user!.role === "SALES" ? req.user!._id : ((req.query.salesman_id as string) || req.user!._id);
+  const targetUser = db.users.find((u) => u._id === targetSalesmanId) || req.user!;
+
+  const att = db.attendance.find((a) => a.salesman_id === targetSalesmanId && a.date === today);
+  const assignedOffice = targetUser.office_id ? db.offices.find((o) => o._id === targetUser.office_id) : (att?.office_id ? db.offices.find(o => o._id === att.office_id) : null);
+
   const workStartTime = (assignedOffice as any)?.work_start_time || (db.settings as any)?.work_start_time || "08:00";
   const workEndTime = (assignedOffice as any)?.work_end_time || (db.settings as any)?.work_end_time || "17:00";
   const checkInStart = (assignedOffice as any)?.check_in_start || (db.settings as any)?.check_in_start || "06:00";
+  const checkInEnd = (assignedOffice as any)?.check_in_end || (db.settings as any)?.check_in_end || "";
+  const checkOutStart = (assignedOffice as any)?.check_out_start || (db.settings as any)?.check_out_start || "16:00";
   const lateToleranceMin = Number((assignedOffice as any)?.late_tolerance_min ?? (db.settings as any)?.late_tolerance_min ?? 15);
+  const workingDays = (assignedOffice as any)?.working_days || (db.settings as any)?.working_days || ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
 
-  res.json({
-    attendance: att || null,
+  const enrichedAtt = att
+    ? {
+        ...att,
+        raw_status: att.status,
+        status: att.check_out_time ? "OFF_DUTY" : "ON_DUTY",
+        office_name: assignedOffice?.office_name || "Kantor Pusat",
+        formatted_check_in: att.check_in_time ? formatDateTimeWIB(att.check_in_time) : "-",
+        formatted_check_out: att.check_out_time ? formatDateTimeWIB(att.check_out_time) : "-",
+        work_duration: att.work_duration_formatted || (att.work_duration_seconds ? formatSecondsToDuration(att.work_duration_seconds) : "-"),
+      }
+    : null;
+
+  return res.json({
+    attendance: enrichedAtt,
     shift_config: {
       work_start_time: workStartTime,
       work_end_time: workEndTime,
       check_in_start: checkInStart,
+      check_in_end: checkInEnd,
+      check_out_start: checkOutStart,
       late_tolerance_min: lateToleranceMin,
+      working_days: workingDays,
+      current_day: getCurrentDayNameWIB(),
       current_time_wib: getCurrentTimeFullWIB(),
       office_name: assignedOffice?.office_name || "Kantor Pusat",
-      radius_m: assignedOffice?.radius_m || 100,
+      radius_m: (assignedOffice as any)?.attendance_radius || assignedOffice?.radius_m || 200,
     },
-    // Backwards compatibility for root properties if direct attendance object is consumed
-    ...(att ? att : {}),
+    // Backwards compatibility
+    ...(enrichedAtt ? enrichedAtt : {}),
   });
 });
 
 apiRouter.get("/attendance/history", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const targetSalesmanId = req.user!.role === "SALES" ? req.user!._id : ((req.query.salesman_id as string) || req.user!._id);
+  const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || "30", 10)));
+
   const history = db.attendance
-    .filter((a) => a.salesman_id === req.user!._id)
+    .filter((a) => a.salesman_id === targetSalesmanId)
     .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 30)
+    .slice(0, limit)
     .map((a) => {
       const office = db.offices.find((o) => o._id === a.office_id);
       return {
@@ -2365,13 +2520,14 @@ apiRouter.get("/attendance/history", authMiddleware, (req: AuthenticatedRequest,
         work_duration: a.work_duration_formatted || (a.work_duration_seconds ? formatSecondsToDuration(a.work_duration_seconds) : "-"),
       };
     });
-  res.json({ items: history, total: history.length });
+  return res.json({ items: history, total: history.length });
 });
 
 apiRouter.get("/attendance", authMiddleware, (req: AuthenticatedRequest, res) => {
-  const { date, from_date, to_date, salesman_id, status, office_id } = req.query as Record<string, string>;
+  const { date, from_date, to_date, salesman_id, status, office_id, q } = req.query as Record<string, string>;
   const isSales = req.user!.role === "SALES";
   const filterSalesId = isSales ? req.user!._id : salesman_id;
+  const searchQuery = (q || "").toLowerCase().trim();
 
   let records = db.attendance.filter((a) => {
     if (filterSalesId && a.salesman_id !== filterSalesId) return false;
@@ -2380,6 +2536,13 @@ apiRouter.get("/attendance", authMiddleware, (req: AuthenticatedRequest, res) =>
     if (to_date && a.date > to_date) return false;
     if (status && a.status !== status) return false;
     if (office_id && a.office_id !== office_id) return false;
+    if (searchQuery) {
+      const u = db.users.find((user) => user._id === a.salesman_id);
+      const off = db.offices.find((o) => o._id === a.office_id);
+      const matchName = u?.name?.toLowerCase().includes(searchQuery);
+      const matchOffice = off?.office_name?.toLowerCase().includes(searchQuery);
+      if (!matchName && !matchOffice) return false;
+    }
     return true;
   });
 
@@ -2403,19 +2566,201 @@ apiRouter.get("/attendance", authMiddleware, (req: AuthenticatedRequest, res) =>
   const total = enriched.length;
   const presentCount = enriched.filter((a) => a.status === "PRESENT").length;
   const lateCount = enriched.filter((a) => a.status === "LATE").length;
+  const absentCount = enriched.filter((a) => a.status === "ABSENT").length;
   const totalLateMinutes = enriched.reduce((sum, a) => sum + (a.late_minutes || 0), 0);
   const onTimePercentage = total > 0 ? Math.round((presentCount / total) * 100) : 100;
 
-  res.json({
+  return res.json({
     items: enriched,
     total,
     metrics: {
       total,
       present_count: presentCount,
       late_count: lateCount,
+      absent_count: absentCount,
       total_late_minutes: totalLateMinutes,
       on_time_percentage: onTimePercentage,
     },
+  });
+});
+
+// Manual attendance entry for Supervisor / Admin (e.g. device breakdown or assigned off-site event)
+apiRouter.post("/attendance/manual", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const { salesman_id, date, check_in_time, check_out_time, office_id, status, notes, reason } = req.body || {};
+
+  if (!salesman_id || !date || !check_in_time) {
+    return res.status(400).json({ detail: "Salesman, tanggal, dan jam check-in wajib diisi." });
+  }
+
+  const user = db.users.find((u) => u._id === salesman_id);
+  if (!user) {
+    return res.status(404).json({ detail: "Pengguna salesman tidak ditemukan." });
+  }
+
+  const targetOfficeId = office_id || user.office_id || "off-1";
+  const office = db.offices.find((o) => o._id === targetOfficeId);
+  const workStartTime = (office as any)?.work_start_time || "08:00";
+  const workEndTime = (office as any)?.work_end_time || "17:00";
+  const lateToleranceMin = Number((office as any)?.late_tolerance_min ?? 15);
+
+  const checkInDate = new Date(check_in_time);
+  const checkInTimeStr = getCurrentTimeHHMMWIB(checkInDate);
+  const lateInfo = calculateAttendanceLateStatus(checkInTimeStr, workStartTime, lateToleranceMin);
+
+  let durationSec = 0;
+  let earlyLeaveMin = 0;
+  let overtimeMin = 0;
+
+  if (check_out_time) {
+    const checkOutDate = new Date(check_out_time);
+    durationSec = Math.max(0, Math.round((checkOutDate.getTime() - checkInDate.getTime()) / 1000));
+    const checkOutTimeStr = getCurrentTimeHHMMWIB(checkOutDate);
+    const checkOutMin = parseTimeToMinutes(checkOutTimeStr);
+    const workEndMin = parseTimeToMinutes(workEndTime);
+    if (checkOutMin < workEndMin) {
+      earlyLeaveMin = workEndMin - checkOutMin;
+    } else {
+      overtimeMin = checkOutMin - workEndMin;
+    }
+  }
+
+  // Check if record exists for this date
+  let att = db.attendance.find((a) => a.salesman_id === salesman_id && a.date === date);
+  if (att) {
+    att.check_in_time = check_in_time;
+    if (check_out_time) att.check_out_time = check_out_time;
+    att.status = status || (lateInfo.isLate ? "LATE" : "PRESENT");
+    att.late_minutes = lateInfo.lateMinutes;
+    att.work_duration_seconds = durationSec;
+    att.work_duration_formatted = durationSec > 0 ? formatSecondsToDuration(durationSec) : undefined;
+    att.early_leave_minutes = earlyLeaveMin;
+    att.overtime_minutes = overtimeMin;
+    (att as any).manual_entry = true;
+    (att as any).manual_reason = reason || notes;
+    (att as any).created_by = req.user!._id;
+  } else {
+    att = {
+      _id: `att-${date}-${salesman_id}`,
+      salesman_id,
+      date,
+      check_in_time,
+      check_out_time: check_out_time || undefined,
+      office_id: targetOfficeId,
+      distance_in_m: 0,
+      status: status || (lateInfo.isLate ? "LATE" : "PRESENT"),
+      scheduled_in: workStartTime,
+      scheduled_out: workEndTime,
+      late_minutes: lateInfo.lateMinutes,
+      early_leave_minutes: earlyLeaveMin,
+      overtime_minutes: overtimeMin,
+      work_duration_seconds: durationSec,
+      work_duration_formatted: durationSec > 0 ? formatSecondsToDuration(durationSec) : undefined,
+      manual_entry: true,
+      manual_reason: reason || notes,
+      created_by: req.user!._id,
+    } as any;
+    db.attendance.push(att);
+  }
+
+  recordAuditLog(
+    req.user!._id,
+    "ATTENDANCE_MANUAL_ENTRY",
+    "attendance",
+    att._id,
+    {
+      salesman_id,
+      salesman_name: user.name,
+      date,
+      status: att.status,
+      reason: reason || notes,
+      entered_by: req.user!.name,
+      entered_by_role: req.user!.role,
+    }
+  );
+
+  syncSingleDoc("attendance", att._id, att);
+
+  return res.status(201).json({
+    message: "Absensi manual berhasil dicatat.",
+    attendance: att,
+  });
+});
+
+// Update / Correct existing attendance record
+apiRouter.put("/attendance/:id", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const att = db.attendance.find((a) => a._id === req.params.id);
+  if (!att) {
+    return res.status(404).json({ detail: "Data absensi tidak ditemukan." });
+  }
+
+  const prevAtt = { ...att };
+  const { status, check_in_time, check_out_time, notes, correction_reason } = req.body || {};
+
+  if (status) att.status = status;
+  if (check_in_time) att.check_in_time = check_in_time;
+  if (check_out_time !== undefined) att.check_out_time = check_out_time;
+  if (notes !== undefined) (att as any).notes = notes;
+
+  // Recalculate duration if both times present
+  if (att.check_in_time && att.check_out_time) {
+    const durSec = Math.max(0, Math.round((new Date(att.check_out_time).getTime() - new Date(att.check_in_time).getTime()) / 1000));
+    att.work_duration_seconds = durSec;
+    att.work_duration_formatted = formatSecondsToDuration(durSec);
+  }
+
+  (att as any).corrected_at = new Date().toISOString();
+  (att as any).corrected_by = req.user!._id;
+  (att as any).correction_reason = correction_reason || notes || "Koreksi administratif";
+
+  recordAuditLog(
+    req.user!._id,
+    "ATTENDANCE_CORRECTION",
+    "attendance",
+    att._id,
+    {
+      attendance_id: att._id,
+      salesman_id: att.salesman_id,
+      previous_state: prevAtt,
+      updated_state: att,
+      correction_reason: (att as any).correction_reason,
+      corrected_by_name: req.user!.name,
+    }
+  );
+
+  syncSingleDoc("attendance", att._id, att);
+
+  return res.json({
+    message: "Koreksi absensi berhasil disimpan.",
+    attendance: att,
+  });
+});
+
+// Delete attendance record
+apiRouter.delete("/attendance/:id", authMiddleware, requireRoles("ADMIN", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const idx = db.attendance.findIndex((a) => a._id === req.params.id);
+  if (idx === -1) {
+    return res.status(404).json({ detail: "Data absensi tidak ditemukan." });
+  }
+
+  const deleted = db.attendance.splice(idx, 1)[0];
+
+  recordAuditLog(
+    req.user!._id,
+    "ATTENDANCE_DELETED",
+    "attendance",
+    req.params.id,
+    {
+      salesman_id: deleted.salesman_id,
+      date: deleted.date,
+      deleted_by_name: req.user!.name,
+    }
+  );
+
+  deleteSingleDoc("attendance", req.params.id);
+
+  return res.json({
+    message: "Data absensi berhasil dihapus.",
+    _id: req.params.id,
   });
 });
 
