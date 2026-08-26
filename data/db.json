@@ -1,0 +1,197 @@
+{
+  "users": [
+    {
+      "_id": "usr-owner",
+      "name": "Andis Moch Solihin",
+      "email": "andismochsolihin@gmail.com",
+      "password_hash": "$2b$10$K/xIhNvTRB7Vy86zcPOMGekTwpMENkvUIpKEoM/UpGj.CHRw8n5eS",
+      "role": "OWNER",
+      "phone": "081122334455",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "usr-admin",
+      "name": "Super Administrator",
+      "email": "admin@mahameru.id",
+      "password_hash": "$2b$10$6JURYgQ49Q0y1j86lQPHPuVEosFbCwSAchNPnkjRn7oj0YdTC32NK",
+      "role": "ADMIN",
+      "phone": "081234567890",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "offices": [
+    {
+      "_id": "off-1",
+      "office_code": "JKT-01",
+      "office_name": "Kantor Pusat & Gudang Jakarta",
+      "address": "Jl. Tebet Barat Dalam Raya No. 12, Tebet, Jakarta Selatan 12810",
+      "latitude": -6.2383,
+      "longitude": 106.8525,
+      "radius_m": 100,
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "areas": [
+    {
+      "_id": "area-1",
+      "code": "AREA-JKT-01",
+      "name": "Jakarta Selatan 1",
+      "office_id": "off-1",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "channels": [
+    {
+      "_id": "ch-1",
+      "code": "GT",
+      "name": "General Trade (Toko Kelontong/Warung)",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ch-2",
+      "code": "MT",
+      "name": "Modern Trade (Minimarket/Supermarket)",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ch-3",
+      "code": "HORECA",
+      "name": "Hotel, Resto & Kafe",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ch-4",
+      "code": "WS",
+      "name": "Wholesaler (Grosir)",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "open_call_reasons": [
+    {
+      "_id": "ocr-1",
+      "code": "CLOSED",
+      "name": "Toko Tutup / Libur",
+      "description": "Outlet sedang tutup saat dikunjungi",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ocr-2",
+      "code": "OWNER_AWAY",
+      "name": "Pemilik / Penanggung Jawab Tidak di Tempat",
+      "description": "Tidak bisa mengambil keputusan PO",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ocr-3",
+      "code": "OVERSTOCK",
+      "name": "Stok Masih Banyak",
+      "description": "Stok produk masih mencukupi hingga kunjungan berikutnya",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ocr-4",
+      "code": "BUDGET",
+      "name": "Kendala Keuangan / Budget",
+      "description": "Belum ada dana belanja",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ocr-5",
+      "code": "RELOCATED",
+      "name": "Toko Sudah Pindah Alamat",
+      "description": "Perlu pembaruan master data outlet",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "_id": "ocr-6",
+      "code": "OTHER",
+      "name": "Alasan Lainnya",
+      "description": "Alasan spesifik dijelaskan pada catatan",
+      "status": "ACTIVE",
+      "created_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "products": [],
+  "skus": [],
+  "prices": [],
+  "promos": [],
+  "routes": [],
+  "outlets": [],
+  "salesmen": [],
+  "sales_outlets": [],
+  "call_plans": [],
+  "call_plan_items": [],
+  "attendance": [],
+  "visits": [],
+  "transactions": [],
+  "inventory": [],
+  "stock_movements": [],
+  "stock_handovers": [],
+  "stock_returns": [],
+  "stock_receivings": [],
+  "sales_stock_ledgers": [],
+  "targets": [],
+  "audit_logs": [
+    {
+      "_id": "audit-init",
+      "action": "SYSTEM_INITIALIZATION",
+      "entity": "SYSTEM",
+      "details": {
+        "message": "Sistem DMS Mahameru diinisialisasi untuk lingkungan produksi."
+      },
+      "user_id": "usr-admin",
+      "entity_id": "SYSTEM",
+      "created_at": "2026-08-26T00:00:00.000Z",
+      "ip_address": "127.0.0.1"
+    }
+  ],
+  "settings": {
+    "_id": "global_settings",
+    "updatedAt": "2026-08-26T00:00:00.000Z",
+    "company_name": "PT Mahameru Insan Mandiri",
+    "work_start_time": "08:00",
+    "work_end_time": "17:00",
+    "check_in_start": "06:00",
+    "check_in_end": "08:30",
+    "check_out_start": "16:00",
+    "late_tolerance_min": 15,
+    "allow_fake_gps": false,
+    "fake_gps_policy": "REJECT",
+    "gps_accuracy_max_m": 50,
+    "max_geofence_m": 200,
+    "office_radius_m": 100,
+    "outlet_radius_m": 100,
+    "duplicate_radius_m": 20,
+    "invoice_prefix": "INV",
+    "currency_symbol": "Rp",
+    "tax_rate_percentage": 11,
+    "default_payment_term_days": 14,
+    "enforce_call_plan": false,
+    "min_visit_minutes": 2,
+    "visit_min_duration_sec": 60,
+    "open_call_reason_required": true,
+    "new_outlet_approval": false,
+    "auto_approve_outlets": true,
+    "allow_early_checkout": false,
+    "enable_audit_logging": true,
+    "offline_sync_enabled": false,
+    "session_timeout_hours": 24,
+    "min_target_daily_calls": 15,
+    "working_days_per_month": 26,
+    "auto_generate_invoice_pdf": true,
+    "invoice_footer_note": "Barang yang sudah dibeli tidak dapat dikembalikan tanpa nota retur resmi."
+  }
+}
