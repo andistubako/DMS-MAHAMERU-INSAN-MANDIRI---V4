@@ -34,7 +34,7 @@ function NavItems({ onNavigate }) {
           onClick={onNavigate}
           data-testid={m.testid}
           className={({ isActive }) =>
-            `flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-150 ${
+            `flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-semibold transition-all duration-150 min-h-[44px] ${
               isActive
                 ? "bg-gradient-to-r from-gold to-gold-light text-navy shadow-xs font-bold"
                 : "text-slate-300 hover:bg-white/10 hover:text-white"
@@ -83,20 +83,20 @@ export default function DesktopLayout({ children, title }) {
           <button
             data-testid="logout-button"
             onClick={doLogout}
-            className="text-slate-400 hover:text-rose-300 hover:bg-white/10 rounded-lg transition-colors p-2 shrink-0 ml-1"
+            className="text-slate-400 hover:text-rose-300 hover:bg-white/10 rounded-lg transition-colors p-2 shrink-0 ml-1 min-h-[36px] min-w-[36px] flex items-center justify-center"
             title="Keluar"
           >
             <LogOut size={17} />
           </button>
         </div>
       </aside>
-      <div className="flex-1 flex flex-col min-w-0">
-        <header className="h-16 bg-white/95 backdrop-blur-xs border-b border-slate-200/90 flex items-center px-4 md:px-8 justify-between shrink-0 z-30 shadow-xs">
-          <div className="flex items-center gap-3">
+      <div className="flex-1 flex flex-col min-w-0 max-w-full overflow-hidden">
+        <header className="h-16 bg-white/95 backdrop-blur-xs border-b border-slate-200/90 flex items-center px-3 sm:px-5 md:px-8 justify-between shrink-0 z-30 shadow-xs">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 mr-2">
             <Sheet open={open} onOpenChange={setOpen}>
               <SheetTrigger asChild>
-                <Button variant="ghost" size="icon" className="md:hidden text-slate-700" data-testid="mobile-menu-button">
-                  <Menu size={20} />
+                <Button variant="ghost" size="icon" className="md:hidden text-slate-700 h-10 w-10 shrink-0" data-testid="mobile-menu-button">
+                  <Menu size={22} />
                 </Button>
               </SheetTrigger>
               <SheetContent side="left" className="bg-navy border-none p-0 w-72 text-white flex flex-col justify-between">
@@ -128,19 +128,19 @@ export default function DesktopLayout({ children, title }) {
                 </div>
               </SheetContent>
             </Sheet>
-            <h1 className="font-heading text-base sm:text-lg font-bold text-navy tracking-tight truncate max-w-[200px] sm:max-w-none" data-testid="page-title">{title || "DMS Mahameru"}</h1>
+            <h1 className="font-heading text-sm sm:text-base md:text-lg font-bold text-navy tracking-tight truncate" data-testid="page-title">{title || "DMS Mahameru"}</h1>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             <div className="text-right leading-tight hidden sm:block">
               <div className="text-sm font-bold text-navy">{user?.name}</div>
               <div className="text-[10px] uppercase tracking-widest text-gold-dark font-bold">{user?.role}</div>
             </div>
-            <div className="w-8 h-8 rounded-full bg-navy text-white flex items-center justify-center text-xs font-bold sm:hidden">
+            <div className="w-8 h-8 rounded-full bg-navy text-white flex items-center justify-center text-xs font-bold sm:hidden shrink-0 shadow-xs">
               {initial}
             </div>
           </div>
         </header>
-        <main className="flex-1 overflow-auto p-3 sm:p-5 md:p-8 bg-slate-50/70">{children}</main>
+        <main className="flex-1 overflow-y-auto overflow-x-hidden p-3 sm:p-5 md:p-8 bg-slate-50/70">{children}</main>
       </div>
     </div>
   );
