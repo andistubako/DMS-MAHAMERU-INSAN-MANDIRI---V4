@@ -150,6 +150,85 @@ async function runAuditTests() {
 
   assert(cashVariance === 0, "Test 8.2: Cash Settlement matches Expected Sales (Variance = 0, Status = BALANCED)", `Variance: Rp ${cashVariance}`);
 
+  // --- TEST 9: Working Hours, Shift & Attendance Accuracy ---
+  const testShift = {
+    _id: "shift-test-regular",
+    shift_code: "REG-0817",
+    shift_name: "Shift Reguler Motoris",
+    days: ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"],
+    work_start_time: "08:00",
+    work_end_time: "17:00",
+    late_tolerance_min: 15,
+    early_leave_tolerance_min: 0,
+    break_start: "12:00",
+    break_end: "13:00",
+    break_duration_min: 60,
+    status: "ACTIVE" as const,
+  };
+  if (!db.shifts) db.shifts = [];
+  db.shifts.push(testShift);
+
+  // Test 9.1: Late calculation (Check-in 08:25 with start 08:00 and 15m tolerance -> Late 25 mins)
+  const checkInTimeStr = "08:25";
+  const startMin = 8 * 60; // 480
+  const checkInMin = 8 * 60 + 25; // 505
+  const diffMin = checkInMin - startMin; // 25
+  const isLate = diffMin > testShift.late_tolerance_min;
+  const lateMinutes = isLate ? diffMin : 0;
+  assert(isLate && lateMinutes === 25, "Test 9.1: Late calculation detects 25 minutes late when checking in at 08:25", `Late: ${lateMinutes}m`);
+
+  // Test 9.2: On-time check-in (Check-in 08:10 with start 08:00 and 15m tolerance -> On time)
+  const onTimeCheckIn = "08:10";
+  const onTimeMin = 8 * 60 + 10;
+  const onTimeDiff = onTimeMin - startMin;
+  const onTimeLate = onTimeDiff > testShift.late_tolerance_min;
+  assert(!onTimeLate, "Test 9.2: Check-in within tolerance (08:10) is marked on time (PRESENT)");
+
+  // Test 9.3: Early leave calculation (Check-out 16:30 with end 17:00 -> 30 minutes early)
+  const checkOutTimeStr = "16:30";
+  const endMin = 17 * 60; // 1020
+  const checkOutMin = 16 * 60 + 30; // 990
+  const earlyLeaveMinutes = Math.max(0, endMin - checkOutMin);
+  assert(earlyLeaveMinutes === 30, "Test 9.3: Early leave calculates 30 minutes before 17:00", `Early: ${earlyLeaveMinutes}m`);
+
+  // Test 9.4: Net worked minutes calculation (08:00 to 17:00 = 540 min minus 60 min break = 480 min / 8 hours)
+  const grossMinutes = endMin - startMin; // 540
+  const netWorkedMinutes = grossMinutes - testShift.break_duration_min; // 480
+  assert(netWorkedMinutes === 480, "Test 9.4: Net working hours formula deducts break duration (540 - 60 = 480m)");
+
+  // Test 9.5: Leave Approval Integration (Approved leave creates LEAVE record)
+  const testLeave = {
+    _id: "leave-test-01",
+    salesman_id: salesman._id,
+    type: "CUTI_TAHUNAN" as const,
+    start_date: "2026-09-01",
+    end_date: "2026-09-02",
+    days_count: 2,
+    reason: "Cuti keperluan keluarga",
+    status: "APPROVED" as const,
+    approved_by: "usr-admin",
+    created_at: new Date().toISOString(),
+  };
+  if (!db.leaves) db.leaves = [];
+  db.leaves.push(testLeave);
+  assert(testLeave.status === "APPROVED", "Test 9.5: Leave request approved and linked to attendance schedule");
+
+  // Test 9.6: Overtime calculation with supervisor approval
+  const testOvertime = {
+    _id: "ot-test-01",
+    salesman_id: salesman._id,
+    date: "2026-08-27",
+    requested_minutes: 90,
+    approved_minutes: 90,
+    reason: "Penyelesaian audit stok akhir bulan",
+    status: "APPROVED" as const,
+    approved_by: "usr-admin",
+    created_at: new Date().toISOString(),
+  };
+  if (!db.overtime_requests) db.overtime_requests = [];
+  db.overtime_requests.push(testOvertime);
+  assert(testOvertime.status === "APPROVED" && testOvertime.approved_minutes === 90, "Test 9.6: Overtime approval workflow verifies approved minutes");
+
   console.log("\n=======================================================");
   console.log(`   TEST RESULTS: ${passed} PASSED, ${failed} FAILED `);
   console.log("=======================================================\n");

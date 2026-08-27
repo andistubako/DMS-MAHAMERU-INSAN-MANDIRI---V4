@@ -125,6 +125,7 @@ export interface Outlet {
   total_revenue?: number;
   created_by: string;
   created_at: string;
+  updated_at?: string;
   photo_url?: string;
   credit_limit?: number;
   term_of_payment?: number;
@@ -1307,7 +1308,7 @@ export function ensureDefaultMasterData() {
       { _id: "ch-4", code: "WS", name: "Wholesaler (Grosir)", status: "ACTIVE", created_at: now },
     ];
   } else {
-    const stdChannels = [
+    const stdChannels: MasterEntity[] = [
       { _id: "ch-1", code: "GT", name: "General Trade (Toko Kelontong/Warung)", status: "ACTIVE", created_at: now },
       { _id: "ch-2", code: "MT", name: "Modern Trade (Minimarket/Supermarket)", status: "ACTIVE", created_at: now },
       { _id: "ch-3", code: "HORECA", name: "Hotel, Resto & Kafe", status: "ACTIVE", created_at: now },

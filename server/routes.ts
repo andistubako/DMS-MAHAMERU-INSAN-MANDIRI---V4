@@ -2032,23 +2032,56 @@ apiRouter.get("/settings/public", (req, res) => {
 
 apiRouter.put("/settings", authMiddleware, requireRoles("ADMIN", "OWNER"), (req: AuthenticatedRequest, res) => {
   const oldSettings = { ...db.settings };
-  Object.assign(db.settings, req.body);
-  if (req.body.company_name) {
-    db.company_profile.companyName = req.body.company_name;
+  const incoming = req.body || {};
+
+  // Numeric sanitization
+  if (incoming.office_latitude != null) incoming.office_latitude = Number(incoming.office_latitude);
+  if (incoming.office_longitude != null) incoming.office_longitude = Number(incoming.office_longitude);
+  if (incoming.office_radius_m != null) incoming.office_radius_m = Number(incoming.office_radius_m);
+  if (incoming.outlet_radius_m != null) incoming.outlet_radius_m = Number(incoming.outlet_radius_m);
+  if (incoming.duplicate_radius_m != null) incoming.duplicate_radius_m = Number(incoming.duplicate_radius_m);
+  if (incoming.gps_accuracy_max_m != null) incoming.gps_accuracy_max_m = Number(incoming.gps_accuracy_max_m);
+  if (incoming.gps_tracking_interval_seconds != null) incoming.gps_tracking_interval_seconds = Number(incoming.gps_tracking_interval_seconds);
+  if (incoming.late_tolerance_min != null) incoming.late_tolerance_min = Number(incoming.late_tolerance_min);
+  if (incoming.working_days_per_month != null) incoming.working_days_per_month = Number(incoming.working_days_per_month);
+  if (incoming.min_target_daily_calls != null) incoming.min_target_daily_calls = Number(incoming.min_target_daily_calls);
+  if (incoming.min_target_daily_effective_calls != null) incoming.min_target_daily_effective_calls = Number(incoming.min_target_daily_effective_calls);
+  if (incoming.tax_rate_percentage != null) incoming.tax_rate_percentage = Number(incoming.tax_rate_percentage);
+  if (incoming.default_payment_term_days != null) incoming.default_payment_term_days = Number(incoming.default_payment_term_days);
+  if (incoming.min_visit_minutes != null) {
+    incoming.min_visit_minutes = Number(incoming.min_visit_minutes);
+    incoming.visit_min_duration_sec = incoming.min_visit_minutes * 60;
+  } else if (incoming.visit_min_duration_sec != null) {
+    incoming.visit_min_duration_sec = Number(incoming.visit_min_duration_sec);
+    incoming.min_visit_minutes = Math.round(incoming.visit_min_duration_sec / 60);
+  }
+
+  if (incoming.fake_gps_policy) {
+    incoming.allow_fake_gps = incoming.fake_gps_policy === "ALLOW";
+  }
+
+  Object.assign(db.settings, incoming);
+
+  if (incoming.company_name) {
+    db.company_profile.companyName = incoming.company_name;
   }
 
   // If head office parameters updated, synchronize default office record
   const headOffice = db.offices.find((o) => o._id === "off-1" || o.code === "HO-JKT") || db.offices[0];
   if (headOffice) {
-    if (req.body.office_name) headOffice.office_name = req.body.office_name;
-    if (req.body.office_address) headOffice.address = req.body.office_address;
-    if (req.body.office_latitude != null) headOffice.latitude = Number(req.body.office_latitude);
-    if (req.body.office_longitude != null) headOffice.longitude = Number(req.body.office_longitude);
-    if (req.body.office_radius_m != null) headOffice.radius_m = Number(req.body.office_radius_m);
-    if (req.body.work_start_time) headOffice.work_start_time = req.body.work_start_time;
-    if (req.body.work_end_time) headOffice.work_end_time = req.body.work_end_time;
-    if (req.body.check_in_start) headOffice.check_in_start = req.body.check_in_start;
-    if (req.body.late_tolerance_min != null) headOffice.late_tolerance_min = Number(req.body.late_tolerance_min);
+    if (incoming.office_name) headOffice.office_name = incoming.office_name;
+    if (incoming.office_address) headOffice.address = incoming.office_address;
+    if (incoming.office_latitude != null) headOffice.latitude = incoming.office_latitude;
+    if (incoming.office_longitude != null) headOffice.longitude = incoming.office_longitude;
+    if (incoming.office_radius_m != null) headOffice.radius_m = incoming.office_radius_m;
+    if (incoming.work_start_time) headOffice.work_start_time = incoming.work_start_time;
+    if (incoming.work_end_time) headOffice.work_end_time = incoming.work_end_time;
+    if (incoming.check_in_start) headOffice.check_in_start = incoming.check_in_start;
+    if (incoming.check_in_end !== undefined) (headOffice as any).check_in_end = incoming.check_in_end;
+    if (incoming.check_out_start) (headOffice as any).check_out_start = incoming.check_out_start;
+    if (incoming.late_tolerance_min != null) headOffice.late_tolerance_min = incoming.late_tolerance_min;
+    if (incoming.working_days) (headOffice as any).working_days = incoming.working_days;
+    if (incoming.gps_accuracy_max_m != null) (headOffice as any).gps_accuracy_max_m = incoming.gps_accuracy_max_m;
     syncSingleDoc("offices", headOffice._id, headOffice);
   }
 
@@ -2390,10 +2423,19 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
     return res.status(400).json({ detail: "Koordinat GPS tidak valid." });
   }
 
-  // 3. Mock Location / Fake GPS Check
-  if (mock_location && !db.settings.allow_fake_gps) {
+  // Mandatory Selfie Validation based on settings
+  if (db.settings.require_selfie_attendance !== false && !photo_in) {
     return res.status(400).json({
-      detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang oleh sistem.",
+      detail: "Foto selfie wajah wajib disertakan saat melakukan absensi masuk.",
+      code: "SELFIE_REQUIRED",
+    });
+  }
+
+  // 3. Mock Location / Fake GPS Check
+  const fakeGpsPolicy = db.settings.fake_gps_policy || "REJECT";
+  if (mock_location && fakeGpsPolicy === "REJECT" && !db.settings.allow_fake_gps) {
+    return res.status(400).json({
+      detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang oleh kebijakan sistem.",
       code: "MOCK_LOCATION_DETECTED",
     });
   }
@@ -2696,6 +2738,17 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
         att.distance_out_m = Math.round(
           haversineMeters(numLat, numLng, Number(assignedOffice.latitude), Number(assignedOffice.longitude))
         );
+
+        const allowedRadius = Number((assignedOffice as any)?.attendance_radius || assignedOffice.radius_m || db.settings.office_radius_m || 200);
+        const enforceOfficeGeofence = db.settings.enforce_office_geofence !== false;
+        if (enforceOfficeGeofence && att.distance_out_m > allowedRadius && force !== true && req.query.force !== "true") {
+          return res.status(400).json({
+            detail: `Absensi pulang ditolak. Anda berada di luar radius kantor (${att.distance_out_m}m > ${allowedRadius}m).`,
+            code: "OUT_OF_OFFICE_RADIUS",
+            distance: att.distance_out_m,
+            allowed_radius: allowedRadius,
+          });
+        }
       }
 
       const targetUser = db.users.find((u) => u._id === targetSalesmanId);
@@ -2708,6 +2761,14 @@ apiRouter.post("/attendance/check-out", authMiddleware, (req: AuthenticatedReque
         syncSingleDoc("users", targetUser._id, targetUser);
       }
     }
+  }
+
+  // Selfie validation on check-out
+  if (db.settings.require_selfie_checkout && !photo_out && force !== true && req.query.force !== "true") {
+    return res.status(400).json({
+      detail: "Foto selfie wajib disertakan saat melakukan absensi pulang.",
+      code: "SELFIE_CHECKOUT_REQUIRED",
+    });
   }
 
   if (photo_out) att.photo_out = photo_out;
@@ -3476,11 +3537,31 @@ apiRouter.post("/outlets", authMiddleware, (req: AuthenticatedRequest, res) => {
     }
   }
 
+  // Duplicate Outlet GPS Proximity Detection based on Settings
+  const duplicateRadius = Number(db.settings.duplicate_radius_m || 0);
+  if (duplicateRadius > 0 && latitude != null && longitude != null) {
+    const numLat = Number(latitude);
+    const numLng = Number(longitude);
+    const nearbyOutlet = db.outlets.find((o) => {
+      if (o.latitude == null || o.longitude == null || (o.latitude === 0 && o.longitude === 0)) return false;
+      const d = haversineMeters(numLat, numLng, Number(o.latitude), Number(o.longitude));
+      return d <= duplicateRadius;
+    });
+
+    if (nearbyOutlet) {
+      return res.status(400).json({
+        detail: `Peringatan Duplikasi Lokasi: Terdeteksi outlet terdaftar "${nearbyOutlet.outlet_name}" (${nearbyOutlet.outlet_code}) dalam radius ${duplicateRadius}m (Jarak: ${Math.round(haversineMeters(numLat, numLng, Number(nearbyOutlet.latitude), Number(nearbyOutlet.longitude)))}m). Periksa kembali data NOO.`,
+        code: "DUPLICATE_OUTLET_LOCATION",
+        existing_outlet: nearbyOutlet,
+      });
+    }
+  }
+
   const newOutletId = `out-${Date.now()}`;
-  // NOO approval workflow: outlet baru dari SALES menunggu approval supervisor
-  // kecuali auto_approve_outlets aktif. Non-sales (admin/spv/owner) langsung ACTIVE.
+  // NOO approval workflow: outlet baru dari SALES menunggu approval supervisor jika new_outlet_approval aktif
   const isSalesCreator = req.user!.role === "SALES";
-  const outletStatus: Outlet["status"] = isSalesCreator && !db.settings.auto_approve_outlets ? "PENDING" : "ACTIVE";
+  const requiresApproval = db.settings.new_outlet_approval !== false && !db.settings.auto_approve_outlets;
+  const outletStatus: Outlet["status"] = isSalesCreator && requiresApproval ? "PENDING" : "ACTIVE";
   const newOutlet: Outlet = {
     _id: newOutletId,
     outlet_code: finalCode,
@@ -3982,6 +4063,32 @@ apiRouter.post("/visits/check-in", authMiddleware, (req: AuthenticatedRequest, r
     return res.status(403).json({ detail: "Akun Anda tidak aktif.", code: "USER_INACTIVE" });
   }
 
+  // Mock Location / Fake GPS Check
+  const fakeGpsPolicy = db.settings.fake_gps_policy || "REJECT";
+  if (req.body?.mock_location && fakeGpsPolicy === "REJECT" && !db.settings.allow_fake_gps) {
+    return res.status(400).json({
+      detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang saat check-in kunjungan.",
+      code: "MOCK_LOCATION_DETECTED",
+    });
+  }
+
+  // GPS Accuracy Check based on settings
+  const maxGpsAccuracy = Number(db.settings.gps_accuracy_max_m || 100);
+  if (req.body?.accuracy != null && Number(req.body.accuracy) > maxGpsAccuracy) {
+    return res.status(400).json({
+      detail: `Akurasi sinyal GPS terlalu rendah (${Math.round(req.body.accuracy)}m). Batas toleransi maksimum ${maxGpsAccuracy}m.`,
+      code: "LOW_GPS_ACCURACY",
+    });
+  }
+
+  // Mandatory Outlet Photo validation based on settings
+  if (db.settings.require_outlet_photo_visit !== false && !photo_url) {
+    return res.status(400).json({
+      detail: "Foto papan nama / fisik display toko wajib diambil saat check-in kunjungan.",
+      code: "OUTLET_PHOTO_REQUIRED",
+    });
+  }
+
   // 2. Validate Outlet exists and is ACTIVE
   const outlet = db.outlets.find((o) => o._id === outlet_id);
   if (!outlet) return res.status(404).json({ detail: "Outlet tidak ditemukan." });
@@ -4006,6 +4113,20 @@ apiRouter.post("/visits/check-in", authMiddleware, (req: AuthenticatedRequest, r
         detail: "Area outlet tidak sesuai dengan area penugasan Anda. Kunjungan ditolak.",
         code: "AREA_MISMATCH",
       });
+    }
+
+    // Enforce Call Plan schedule if enabled in settings
+    const enforceCallPlan = db.settings.enforce_call_plan_schedule || db.settings.enforce_call_plan;
+    if (enforceCallPlan) {
+      const today = getTodayWIB();
+      const cp = db.call_plans.find((p) => p.salesman_id === req.user!._id && p.date === today);
+      const isPlanned = cp ? db.call_plan_items.some((i) => i.call_plan_id === cp._id && i.outlet_id === outlet_id) : false;
+      if (!isPlanned) {
+        return res.status(400).json({
+          detail: `Kebijakan Rute Kerja: Outlet "${outlet.outlet_name}" (${outlet.outlet_code}) tidak terdaftar dalam Call Plan harian Anda hari ini.`,
+          code: "OUTLET_NOT_IN_CALL_PLAN",
+        });
+      }
     }
   }
 
@@ -4236,9 +4357,26 @@ apiRouter.get("/transactions/sku-list", authMiddleware, (req: AuthenticatedReque
 });
 
 apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest, res) => {
-  const { outlet_id, visit_id, items, payment_method } = req.body || {};
+  const { outlet_id, visit_id, items, payment_method, latitude, longitude, mock_location } = req.body || {};
   if (!outlet_id || !items || !items.length) {
     return res.status(400).json({ detail: "Outlet dan daftar item produk wajib diisi." });
+  }
+
+  // Mock Location / Fake GPS Check
+  const fakeGpsPolicy = db.settings.fake_gps_policy || "REJECT";
+  if (mock_location && fakeGpsPolicy === "REJECT" && !db.settings.allow_fake_gps) {
+    return res.status(400).json({
+      detail: "Penggunaan Fake GPS / Mock Location terdeteksi dan dilarang saat transaksi penjualan.",
+      code: "MOCK_LOCATION_DETECTED",
+    });
+  }
+
+  // Mandatory GPS on Order validation based on settings
+  if (db.settings.require_gps_on_order !== false && (latitude == null || longitude == null)) {
+    return res.status(400).json({
+      detail: "Titik koordinat GPS akurat wajib disertakan saat mencatat transaksi penjualan.",
+      code: "GPS_REQUIRED_ON_ORDER",
+    });
   }
 
   // Check Idempotency to prevent duplicate transaction submissions
@@ -4309,7 +4447,8 @@ apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest
 
       const today = getTodayWIB();
       const count = db.transactions.length + 1;
-      const invoiceNumber = `INV/${today.replace(/-/g, "")}/${String(count).padStart(3, "0")}`;
+      const invoicePrefix = (db.settings.invoice_prefix || "INV").trim().toUpperCase();
+      const invoiceNumber = `${invoicePrefix}/${today.replace(/-/g, "")}/${String(count).padStart(3, "0")}`;
       const newTxnId = `txn-${Date.now()}`;
 
       let subtotal = 0;
@@ -4391,6 +4530,11 @@ apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest
       const totalVolume = processedItems.reduce((acc, it) => acc + (it.volume || it.quantity), 0);
       const isCredit = payment_method === "CREDIT" || payment_method === "TEMPO";
 
+      // Tax calculation based on settings
+      const taxRate = Number(db.settings.tax_rate_percentage) || 0;
+      const taxAmount = Math.round((subtotal * taxRate) / 100);
+      const grandTotal = subtotal + taxAmount;
+
       const newTxn: Transaction = {
         _id: newTxnId,
         transaction_code: invoiceNumber,
@@ -4403,12 +4547,17 @@ apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest
         total_volume: totalVolume,
         subtotal,
         discount_total: 0,
-        tax: 0,
-        total: subtotal,
+        tax: taxAmount,
+        total: grandTotal,
         payment_method: isCredit ? "CREDIT" : (payment_method || "CASH"),
         status: isCredit ? "PENDING" : "PAID",
         created_at: new Date().toISOString(),
       };
+
+      if (latitude != null && longitude != null) {
+        (newTxn as any).latitude = Number(latitude);
+        (newTxn as any).longitude = Number(longitude);
+      }
 
       db.transactions.push(newTxn);
       syncSingleDoc("transactions", newTxn._id, newTxn);
@@ -4427,9 +4576,9 @@ apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest
           outlet_id,
           salesman_id: req.user!._id,
           due_date: dueDateStr,
-          total_amount: subtotal,
+          total_amount: grandTotal,
           paid_amount: 0,
-          remaining_amount: subtotal,
+          remaining_amount: grandTotal,
           status: "UNPAID",
           payments: [],
           created_at: new Date().toISOString(),
@@ -11187,7 +11336,7 @@ apiRouter.post("/outlets/:id/approve", authMiddleware, requireRoles("SUPERVISOR"
   if (!outlet) return res.status(404).json({ detail: "Outlet tidak ditemukan." });
 
   outlet.status = "ACTIVE";
-  outlet.lifecycle_status = "REGISTERED";
+  outlet.lifecycle_status = "NOO";
   (outlet as any).approved_by = req.user!._id;
   (outlet as any).approved_at = new Date().toISOString();
   outlet.updated_at = new Date().toISOString();
@@ -11215,7 +11364,7 @@ apiRouter.post("/outlets/:id/reject", authMiddleware, requireRoles("SUPERVISOR",
 
   const { reason } = req.body || {};
   outlet.status = "INACTIVE";
-  outlet.lifecycle_status = "INACTIVE";
+  outlet.lifecycle_status = "DORMANT";
   (outlet as any).rejection_reason = reason || "Ditolak saat verifikasi NOO";
   (outlet as any).rejected_by = req.user!._id;
   (outlet as any).rejected_at = new Date().toISOString();
@@ -11523,7 +11672,7 @@ apiRouter.get("/reconciliations/daily", authMiddleware, (req: AuthenticatedReque
       .reduce((sum, t) => sum + (t.total || 0), 0);
 
     const creditSales = db.transactions
-      .filter((t) => t.salesman_id === sales._id && t.transaction_date.startsWith(business_date) && t.status !== "CANCELLED" && (t.payment_method === "CREDIT" || t.payment_method === "TEMPO"))
+      .filter((t) => t.salesman_id === sales._id && t.transaction_date.startsWith(business_date) && t.status !== "CANCELLED" && (t.payment_method === "CREDIT" || (t.payment_method as any) === "TEMPO"))
       .reduce((sum, t) => sum + (t.total || 0), 0);
 
     let collectedReceivables = 0;
