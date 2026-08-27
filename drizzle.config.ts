@@ -10,8 +10,9 @@ const password = process.env.SQL_ADMIN_PASSWORD || "";
 
 export default defineConfig({
   schema: "./src/db/schema.ts",
+  out: "./drizzle",
   dialect: "postgresql",
-  breakpoints: false,
+  schemaFilter: ["public"],
   dbCredentials: {
     host: sqlHost,
     user: user,

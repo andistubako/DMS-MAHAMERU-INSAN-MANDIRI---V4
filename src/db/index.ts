@@ -1,24 +1,34 @@
-import { drizzle } from 'drizzle-orm/node-postgres';
-import pg from 'pg';
-import * as schema from './schema.js';
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import * as schema from "./schema.js";
 
-const { Pool } = pg;
+// Add global connection pool caching to persist across hot-reloads
+declare global {
+  var _postgresPool: Pool | undefined;
+}
 
-// Cloud SQL configuration via Unix socket or TCP
-const pool = new Pool({
-  user: process.env.SQL_USER || 'ai_studio_app_user',
-  password: process.env.SQL_PASSWORD || '',
-  database: process.env.SQL_DB_NAME || 'cloud_sql_development_database',
-  host: process.env.SQL_HOST || '/app/cloudsql/grounded-pixel-zdtd0:asia-southeast1:ai-studio-10b64a83',
-  port: Number(process.env.SQL_PORT) || 5432,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
+// Function to create or retrieve the connection pool.
+export const createPool = () => {
+  if (!global._postgresPool) {
+    global._postgresPool = new Pool({
+      host: process.env.SQL_HOST,
+      user: process.env.SQL_USER,
+      password: process.env.SQL_PASSWORD,
+      database: process.env.SQL_DB_NAME,
+      max: 10,
+      connectionTimeoutMillis: 15000,
+    });
 
-pool.on('error', (err) => {
-  console.error('[Cloud SQL Pool Error]:', err);
-});
+    // Prevent unhandled pool-level errors from crashing the application
+    global._postgresPool.on("error", (err) => {
+      console.error("Unexpected error on idle SQL pool client:", err);
+    });
+  }
+  return global._postgresPool;
+};
 
-export const db = drizzle(pool, { schema });
-export { pool };
+// Create or retrieve the pool instance.
+export const pool = createPool();
+
+// Initialize Drizzle with the pool and schema.
+export const sqlDb = drizzle(pool, { schema });

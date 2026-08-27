@@ -259,12 +259,17 @@ export interface InventoryItem {
   location_type: "WAREHOUSE" | "SALES";
   location_id: string; // office_id if WAREHOUSE, salesman user_id if SALES
   office_id?: string; // backward compat alias
+  warehouse_id?: string;
   sku_id: string;
   stock_on_hand: number;
   allocated_stock: number;
   available_stock: number;
+  quantity?: number;
   reorder_level?: number;
-  updated_at: string;
+  updated_at?: string;
+  last_updated?: string;
+  status?: string;
+  [key: string]: any;
 }
 
 export type StockMovementType =
@@ -455,6 +460,7 @@ export interface CompanyProfile {
   createdAt: string;
   updatedAt: string;
   updatedBy: string;
+  [key: string]: any;
 }
 
 // In-Memory Database collections with Disk Persistence
@@ -576,7 +582,7 @@ export const db = {
     auto_generate_invoice_pdf: true,
     enable_audit_logging: true,
     session_timeout_hours: 24,
-  },
+  } as Record<string, any>,
 };
 
 // Seed initial clean baseline data (System accounts & administrative taxonomy only)
@@ -938,6 +944,251 @@ export function ensureDefaultUsers() {
   }
 }
 
+export function auditAndRepairDatabase(): { fixedIssues: string[]; totalRecords: number; status: string } {
+  const fixedIssues: string[] = [];
+  const now = new Date().toISOString();
+
+  // 1. Ensure Company Profile & Settings
+  if (!db.company_profile) {
+    db.company_profile = {
+      _id: "cp-1",
+      companyId: "cp-1",
+      companyName: "PT. Mahameru Distribusi Nusantara",
+      companyLegalName: "PT. Mahameru Distribusi Nusantara",
+      companyCode: "MHM",
+      companyAddress: "Jl. Tebet Barat Dalam Raya No. 12, Jakarta Selatan 12810",
+      address: "Jl. Tebet Barat Dalam Raya No. 12, Jakarta Selatan 12810",
+      companyPhone: "0812-3456-7890",
+      phone: "0812-3456-7890",
+      companyEmail: "info@mahameru.id",
+      email: "info@mahameru.id",
+      companyWebsite: "https://mahameru.id",
+      website: "https://mahameru.id",
+      companyDescription: "Distributor FMCG & Consumer Goods",
+      description: "Distributor FMCG & Consumer Goods",
+      createdAt: now,
+      updatedAt: now,
+      updatedBy: "usr-owner",
+    } as CompanyProfile;
+    fixedIssues.push("Initialized default company_profile.");
+  }
+
+  if (!db.settings) {
+    db.settings = {
+      company_name: db.company_profile?.companyName || "PT. Mahameru Distribusi Nusantara",
+      office_address: db.company_profile?.companyAddress || "Jl. Tebet Barat Dalam Raya No. 12, Jakarta Selatan 12810",
+      office_name: "Kantor Pusat Mahameru",
+      company_phone: db.company_profile?.companyPhone || "0812-3456-7890",
+      company_email: db.company_profile?.companyEmail || "info@mahameru.id",
+      currency_symbol: "Rp",
+      office_latitude: -6.2383,
+      office_longitude: 106.8525,
+      office_radius_m: 100,
+      max_geofence_m: 150,
+      outlet_radius_m: 150,
+      enforce_office_geofence: true,
+      enforce_outlet_geofence: true,
+      allow_fake_gps: false,
+      allow_early_checkout: false,
+      check_in_start: "07:30",
+      check_out_start: "16:30",
+      late_tolerance_min: 15,
+      visit_min_duration_sec: 60,
+      auto_approve_outlets: true,
+      default_credit_limit: 10000000,
+      default_payment_term_days: 14,
+    } as Record<string, any>;
+    fixedIssues.push("Initialized global system settings with standard defaults.");
+  }
+
+  // 2. Ensure Master Offices
+  if (!Array.isArray(db.offices) || db.offices.length === 0) {
+    db.offices = [
+      {
+        _id: "off-1",
+        office_code: "JKT-01",
+        office_name: "Kantor Pusat & Gudang Jakarta",
+        address: "Jl. Tebet Barat Dalam Raya No. 12, Tebet, Jakarta Selatan 12810",
+        latitude: -6.2383,
+        longitude: 106.8525,
+        radius_m: 100,
+        status: "ACTIVE",
+        created_at: now,
+      },
+    ];
+    fixedIssues.push("Created default headquarters office off-1.");
+  }
+
+  const validOfficeIds = new Set(db.offices.map((o) => o._id));
+
+  // 3. Ensure Master Users & Passwords
+  ensureDefaultUsers();
+
+  // Repair user references
+  for (const user of db.users) {
+    if (!user.office_id || !validOfficeIds.has(user.office_id)) {
+      user.office_id = "off-1";
+      fixedIssues.push(`Assigned user ${user.name} (${user.email}) to default office off-1.`);
+    }
+  }
+
+  // 4. Ensure Master Area & Channels
+  ensureDefaultMasterData();
+
+  // 5. Ensure Salesmen profiles exist for all SALES users
+  if (!Array.isArray(db.salesmen)) db.salesmen = [];
+  const salesUsers = db.users.filter((u) => u.role === "SALES");
+  for (const su of salesUsers) {
+    let sm = db.salesmen.find((s) => s.user_id === su._id || s._id === su._id || s.email === su.email);
+    if (!sm) {
+      sm = {
+        _id: `sm-${su._id.replace("usr-", "")}`,
+        user_id: su._id,
+        sales_name: su.name,
+        name: su.name,
+        email: su.email,
+        phone: su.phone || "081234567890",
+        area_id: su.area_id || "area-1",
+        office_id: su.office_id || "off-1",
+        status: su.status || "ACTIVE",
+        created_at: su.created_at || now,
+      };
+      db.salesmen.push(sm);
+      fixedIssues.push(`Created matching salesman profile for user ${su.name}.`);
+    }
+  }
+
+  // 6. Repair Outlets (GPS coordinates, status, missing fields)
+  if (!Array.isArray(db.outlets)) db.outlets = [];
+  for (const outlet of db.outlets) {
+    if (!outlet.area_id) {
+      outlet.area_id = "area-1";
+      fixedIssues.push(`Repaired area_id for outlet ${outlet.outlet_name || outlet._id}.`);
+    }
+    if (!outlet.channel_id) {
+      outlet.channel_id = "ch-1";
+      fixedIssues.push(`Repaired channel_id for outlet ${outlet.outlet_name || outlet._id}.`);
+    }
+    if (typeof outlet.latitude !== "number" || isNaN(outlet.latitude)) {
+      outlet.latitude = -6.2383;
+      outlet.longitude = 106.8525;
+      fixedIssues.push(`Repaired GPS coordinates for outlet ${outlet.outlet_name || outlet._id}.`);
+    }
+    if (!outlet.status) outlet.status = "ACTIVE";
+  }
+
+  // 7. Repair Products, SKUs & Prices
+  if (!Array.isArray(db.products)) db.products = [];
+  if (!Array.isArray(db.skus)) db.skus = [];
+  if (!Array.isArray(db.prices)) db.prices = [];
+
+  for (const prod of db.products) {
+    const hasSku = db.skus.some((s) => s.product_id === prod._id);
+    if (!hasSku) {
+      const newSkuId = `sku-${prod._id.replace("prod-", "")}`;
+      db.skus.push({
+        _id: newSkuId,
+        product_id: prod._id,
+        sku_code: `${prod.product_code || prod._id}-BOX`,
+        sku_name: `${prod.name || prod.product_name} Box`,
+        packaging_type: "BOX",
+        conversion_to_base: 1,
+        status: "ACTIVE",
+        created_at: now,
+      });
+      db.prices.push({
+        _id: `price-${newSkuId}`,
+        sku_id: newSkuId,
+        area_id: "area-1",
+        price: 50000,
+        status: "ACTIVE",
+        created_at: now,
+      });
+      fixedIssues.push(`Generated missing SKU and Price record for product ${prod.name || prod._id}.`);
+    }
+  }
+
+  // 8. Repair Inventory Integrity (Warehouse Stock & Non-Negative Balances)
+  if (!Array.isArray(db.inventory)) db.inventory = [];
+  for (const inv of db.inventory) {
+    if (typeof inv.stock_on_hand !== "number" || isNaN(inv.stock_on_hand) || inv.stock_on_hand < 0) {
+      inv.stock_on_hand = typeof inv.quantity === "number" && inv.quantity >= 0 ? inv.quantity : 0;
+      fixedIssues.push(`Corrected invalid negative/NaN inventory stock_on_hand for ${inv._id || inv.sku_id}.`);
+    }
+    if (typeof inv.allocated_stock !== "number" || isNaN(inv.allocated_stock) || inv.allocated_stock < 0) {
+      inv.allocated_stock = 0;
+    }
+    inv.available_stock = Math.max(0, inv.stock_on_hand - inv.allocated_stock);
+    inv.quantity = inv.stock_on_hand;
+  }
+
+  // Ensure warehouse inventory exists for all SKUs
+  for (const sku of db.skus) {
+    const whInv = db.inventory.find((i) => (i.location_id === "off-1" || i.warehouse_id === "off-1" || i.warehouse_id === "wh-1") && i.sku_id === sku._id);
+    if (!whInv) {
+      db.inventory.push({
+        _id: `inv-wh1-${sku._id}`,
+        warehouse_id: "off-1",
+        location_type: "WAREHOUSE",
+        location_id: "off-1",
+        sku_id: sku._id,
+        stock_on_hand: 500,
+        allocated_stock: 0,
+        available_stock: 500,
+        quantity: 500,
+        status: "ACTIVE",
+        updated_at: now,
+        last_updated: now,
+      });
+      fixedIssues.push(`Initialized warehouse inventory for SKU ${sku.sku_name || sku._id}.`);
+    }
+  }
+
+  // 9. Repair Transactions (Volume, Subtotal, Totals calculation)
+  if (!Array.isArray(db.transactions)) db.transactions = [];
+  for (const txn of db.transactions) {
+    if (Array.isArray(txn.items)) {
+      let calculatedVolume = 0;
+      let calculatedSubtotal = 0;
+      for (const item of txn.items) {
+        const q = Number(item.quantity || item.qty || 0);
+        const p = Number(item.unit_price || item.unitPrice || 0);
+        const d = Number(item.discount || 0);
+        item.volume = q;
+        item.subtotal = q * p - d;
+        calculatedVolume += q;
+        calculatedSubtotal += item.subtotal;
+      }
+      if (txn.total_volume !== calculatedVolume) {
+        txn.total_volume = calculatedVolume;
+        fixedIssues.push(`Recalculated total volume for transaction ${txn.invoice_number || txn._id}.`);
+      }
+      if (typeof txn.total !== "number" || isNaN(txn.total)) {
+        txn.subtotal = calculatedSubtotal;
+        txn.total = calculatedSubtotal + Number(txn.tax || 0) - Number(txn.discount_total || 0);
+        fixedIssues.push(`Recalculated total amount for transaction ${txn.invoice_number || txn._id}.`);
+      }
+    }
+  }
+
+  // Save changes to disk
+  saveDatabaseToDisk(true);
+
+  // Count total records
+  let totalRecords = 0;
+  for (const key of Object.keys(db)) {
+    const val = (db as any)[key];
+    if (Array.isArray(val)) totalRecords += val.length;
+    else if (val && typeof val === "object") totalRecords += 1;
+  }
+
+  return {
+    fixedIssues,
+    totalRecords,
+    status: fixedIssues.length === 0 ? "DATABASE_HEALTHY" : "DATABASE_REPAIRED",
+  };
+}
+
 export function ensureDefaultMasterData() {
   const now = new Date().toISOString();
 
@@ -1042,10 +1293,12 @@ if (!loadDatabaseFromDisk()) {
   seedDatabase();
   ensureDefaultUsers();
   ensureDefaultMasterData();
+  auditAndRepairDatabase();
   saveDatabaseToDisk();
 } else {
   ensureDefaultUsers();
   ensureDefaultMasterData();
+  auditAndRepairDatabase();
   saveDatabaseToDisk();
 }
 

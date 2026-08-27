@@ -23,8 +23,10 @@ import {
   SalesStockLedger,
   Target,
   saveDatabaseToDisk,
+  auditAndRepairDatabase,
 } from "./data.js";
-import { syncToFirestore, getSyncStats, deleteSingleDoc, syncSingleDoc } from "./firestoreSync.js";
+import { syncToFirestore, getSyncStats, deleteSingleDoc, syncSingleDoc, ALL_SYNC_COLLECTIONS } from "./firestoreSync.js";
+import { migrateAllToCloudSql, getCloudSqlStats, initializeCloudSqlTables } from "./cloudsqlSync.js";
 import {
   AuthenticatedRequest,
   generateTokens,
@@ -51,12 +53,53 @@ apiRouter.use((req, res, next) => {
 });
 
 // Real-time database sync diagnostic status
-apiRouter.get("/system/db-status", (req, res) => {
+apiRouter.get("/system/db-status", async (req, res) => {
   const stats = getSyncStats();
+  const cloudSqlStats = await getCloudSqlStats();
+  res.json({
+    success: true,
+    data: {
+      ...stats,
+      cloudSql: cloudSqlStats,
+    },
+  });
+});
+
+// Cloud SQL PostgreSQL status and diagnostics
+apiRouter.get("/system/cloudsql-status", async (req, res) => {
+  const stats = await getCloudSqlStats();
   res.json({
     success: true,
     data: stats,
   });
+});
+
+// Trigger full migration to Google Cloud SQL (PostgreSQL)
+apiRouter.post("/system/migrate-to-cloudsql", authMiddleware, requireRoles("ADMIN", "OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = await migrateAllToCloudSql();
+    recordAuditLog(
+      req.user!._id,
+      "MIGRATE_DATABASE_TO_CLOUDSQL",
+      "SYSTEM",
+      "ALL_DATA",
+      {
+        migrated_by: req.user!.name || req.user!.email,
+        role: req.user!.role,
+        total_records: result.totalRecords,
+      }
+    );
+    res.json({
+      success: result.success,
+      message: result.message,
+      data: result,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: "Gagal migrasi ke Cloud SQL: " + (error?.message || String(error)),
+    });
+  }
 });
 
 // Download full database snapshot (JSON export) khusus ADMIN dan OWNER
@@ -101,6 +144,136 @@ apiRouter.get("/system/export-db", authMiddleware, requireRoles("ADMIN", "OWNER"
   }
 });
 
+// Upload and restore database from JSON backup file khusus ADMIN dan OWNER
+apiRouter.post("/system/import-db", authMiddleware, requireRoles("ADMIN", "OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const payload = req.body?.database || req.body?.data || req.body;
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({
+        success: false,
+        message: "Format payload database tidak valid. Harus berupa data JSON backup Mahameru DMS.",
+      });
+    }
+
+    const mode = req.body?.mode || "merge"; // "merge" | "replace"
+    const summary: Record<string, number> = {};
+    let totalImported = 0;
+
+    // Cache existing users to keep password hashes if missing in uploaded data
+    const existingUsersMap = new Map<string, any>();
+    for (const u of db.users || []) {
+      if (u._id) existingUsersMap.set(u._id, u);
+      if (u.email) existingUsersMap.set(u.email.toLowerCase(), u);
+    }
+
+    // Process all standard collections
+    for (const { key } of ALL_SYNC_COLLECTIONS) {
+      if (Array.isArray(payload[key])) {
+        const incoming = payload[key];
+        if (mode === "replace") {
+          if (key === "users") {
+            (db as any)[key] = incoming.map((nu: any) => {
+              const matched = existingUsersMap.get(nu._id) || existingUsersMap.get(nu.email?.toLowerCase());
+              if (!nu.password_hash && matched?.password_hash) {
+                return { ...nu, password_hash: matched.password_hash };
+              }
+              return nu;
+            });
+          } else {
+            (db as any)[key] = incoming;
+          }
+          summary[key] = incoming.length;
+          totalImported += incoming.length;
+        } else {
+          // Merge mode (default)
+          const currentList = Array.isArray((db as any)[key]) ? (db as any)[key] : [];
+          const existingMap = new Map<string, number>();
+          currentList.forEach((it: any, idx: number) => {
+            const id = it?._id || it?.id;
+            if (id) existingMap.set(String(id), idx);
+          });
+
+          let importedForCol = 0;
+          for (const item of incoming) {
+            if (!item) continue;
+            const itemId = item._id || item.id;
+            if (!itemId) continue;
+
+            if (key === "users" && !item.password_hash) {
+              const matched = existingUsersMap.get(item._id) || existingUsersMap.get(item.email?.toLowerCase());
+              if (matched?.password_hash) {
+                item.password_hash = matched.password_hash;
+              }
+            }
+
+            const existingIdx = existingMap.get(String(itemId));
+            if (existingIdx !== undefined) {
+              currentList[existingIdx] = { ...currentList[existingIdx], ...item };
+            } else {
+              currentList.push(item);
+              existingMap.set(String(itemId), currentList.length - 1);
+            }
+            importedForCol++;
+          }
+          (db as any)[key] = currentList;
+          summary[key] = importedForCol;
+          totalImported += importedForCol;
+        }
+      }
+    }
+
+    // Single objects: company_profile & settings
+    if (payload.company_profile && typeof payload.company_profile === "object") {
+      db.company_profile = { ...db.company_profile, ...payload.company_profile };
+      summary["company_profile"] = 1;
+    }
+    if (payload.settings && typeof payload.settings === "object") {
+      db.settings = { ...db.settings, ...payload.settings };
+      summary["settings"] = 1;
+    }
+
+    // Run audit and repair to maintain referential integrity
+    const repairResult = auditAndRepairDatabase();
+
+    // Persist to local disk JSON backup
+    saveDatabaseToDisk(true);
+
+    // Sync all updated documents to Primary Database: Google Cloud Firestore
+    await syncToFirestore(true, true);
+
+    // Audit log the upload action
+    recordAuditLog(
+      req.user!._id,
+      "RESTORE_DATABASE_UPLOAD",
+      "SYSTEM",
+      "ALL_DATA",
+      {
+        restored_by: req.user!.name || req.user!.email,
+        role: req.user!.role,
+        total_records_processed: totalImported,
+        mode,
+        summary,
+      }
+    );
+
+    res.json({
+      success: true,
+      message: `Database berhasil diunggah & dipulihkan! Total ${totalImported} data berhasil disinkronkan ke Google Cloud Firestore.`,
+      data: {
+        totalImported,
+        summary,
+        repairResult,
+        syncStats: getSyncStats(),
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: "Gagal mengunggah & memulihkan database: " + (error?.message || String(error)),
+    });
+  }
+});
+
 // Trigger immediate real-time synchronization to Google Cloud Firestore
 apiRouter.post("/system/sync-now", async (req, res) => {
   try {
@@ -116,6 +289,27 @@ apiRouter.post("/system/sync-now", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to sync database: " + (error?.message || String(error)),
+    });
+  }
+});
+
+// Comprehensive Database Audit & Auto-Repair
+apiRouter.post("/system/repair-database", authMiddleware, requireRoles("ADMIN", "OWNER"), async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = auditAndRepairDatabase();
+    await syncToFirestore(true, true);
+    res.json({
+      success: true,
+      message: "Pemeriksaan dan perbaikan integritas database berhasil dilakukan.",
+      data: {
+        ...result,
+        syncStats: getSyncStats(),
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: "Gagal memperbaiki database: " + (error?.message || String(error)),
     });
   }
 });
@@ -1862,6 +2056,9 @@ apiRouter.put("/settings", authMiddleware, requireRoles("ADMIN", "OWNER"), (req:
     }
   );
 
+  saveDatabaseToDisk(true);
+  syncToFirestore(true, false).catch((err) => console.warn("Firestore settings sync error:", err?.message));
+
   res.json({ settings: db.settings, ...db.settings });
 });
 
@@ -1924,6 +2121,9 @@ apiRouter.post("/settings/reset-defaults", authMiddleware, requireRoles("ADMIN",
     ...db.settings,
     ...defaultSettings,
   };
+
+  saveDatabaseToDisk(true);
+  syncToFirestore(true, false).catch((err) => console.warn("Firestore settings reset sync error:", err?.message));
 
   recordAuditLog(
     req.user!._id,
@@ -2282,8 +2482,9 @@ apiRouter.post("/attendance/check-in", authMiddleware, (req: AuthenticatedReques
   // 9. Geofence Distance Validation
   const distanceToAssignedOffice = Math.round(haversineMeters(numLat, numLng, offLat, offLng));
   const allowedRadius = Number((assignedOffice as any).attendance_radius || assignedOffice.radius_m || (db.settings as any).office_radius_m || (db.settings as any).max_geofence_m || 200);
+  const enforceOfficeGeofence = (db.settings as any).enforce_office_geofence !== false;
 
-  if (distanceToAssignedOffice > allowedRadius) {
+  if (enforceOfficeGeofence && distanceToAssignedOffice > allowedRadius) {
     return res.status(400).json({
       detail: `Absensi masuk ditolak. Anda wajib melakukan absensi di kantor penugasan Anda: "${assignedOffice.office_name}". Jarak Anda saat ini: ${distanceToAssignedOffice}m (Maksimal radius yang diizinkan: ${allowedRadius}m).`,
       code: "OUT_OF_OFFICE_RADIUS",
@@ -3812,10 +4013,13 @@ apiRouter.post("/visits/check-in", authMiddleware, (req: AuthenticatedRequest, r
   }
 
   const distance = haversineMeters(latitude, longitude, outlet.latitude, outlet.longitude);
-  const maxGeofence = db.settings.max_geofence_m || 200;
-  if (distance > maxGeofence) {
+  const maxGeofence = Number(db.settings.outlet_radius_m || db.settings.max_geofence_m || 200);
+  const enforceGeofence = db.settings.enforce_outlet_geofence !== false;
+  if (enforceGeofence && distance > maxGeofence) {
     return res.status(400).json({
       detail: `Anda berada di luar radius outlet (${distance}m > ${maxGeofence}m). Dekati outlet untuk check-in.`,
+      distance,
+      allowed_radius: maxGeofence,
     });
   }
 

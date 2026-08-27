@@ -139,14 +139,26 @@ function getPickerMarkerIcon() {
   });
 }
 
-function ChangeView({ center, zoom, followUser, userCoords }) {
+function ChangeView({ center, zoom, followUser, userCoords, onUserDrag }) {
   const map = useMap();
+  const lastCenterRef = useRef(null);
+
+  useMapEvents({
+    dragstart() {
+      if (onUserDrag) onUserDrag();
+    },
+    zoomstart() {
+      if (onUserDrag) onUserDrag();
+    },
+  });
+
   useEffect(() => {
     if (followUser && userCoords && !isNaN(userCoords.lat) && !isNaN(userCoords.lng)) {
       map.setView([userCoords.lat, userCoords.lng], zoom || map.getZoom(), {
         animate: true,
         duration: 0.8,
       });
+      lastCenterRef.current = [userCoords.lat, userCoords.lng];
       return;
     }
 
@@ -157,10 +169,21 @@ function ChangeView({ center, zoom, followUser, userCoords }) {
       !isNaN(center[0]) &&
       !isNaN(center[1])
     ) {
-      map.setView(center, zoom || map.getZoom(), {
-        animate: true,
-        duration: 0.8,
-      });
+      const [newLat, newLng] = center;
+      const last = lastCenterRef.current;
+      const isFirst = !last;
+      const hasChanged =
+        !last ||
+        Math.abs(last[0] - newLat) > 0.0001 ||
+        Math.abs(last[1] - newLng) > 0.0001;
+
+      if (hasChanged) {
+        lastCenterRef.current = [newLat, newLng];
+        map.setView(center, isFirst ? (zoom || map.getZoom()) : map.getZoom(), {
+          animate: true,
+          duration: 0.8,
+        });
+      }
     }
   }, [center, zoom, followUser, userCoords, map]);
   return null;
@@ -704,6 +727,7 @@ export default function MapView({
           zoom={zoom}
           followUser={followUser}
           userCoords={liveUserCoords}
+          onUserDrag={() => setFollowUser(false)}
         />
 
         <FitBoundsHandler

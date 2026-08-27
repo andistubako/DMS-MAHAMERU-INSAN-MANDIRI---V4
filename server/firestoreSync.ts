@@ -1,7 +1,6 @@
-import { syncToCloudSql, syncDeleteFromCloudSql, isCloudSqlHealthy } from "./cloudSqlSync.js";
 import { db, saveDatabaseToDisk } from "./data.js";
 import { getFirestoreDB } from "./firebase.js";
-import { doc, setDoc, deleteDoc } from "firebase/firestore";
+import { doc, setDoc, deleteDoc, collection, getDocs } from "firebase/firestore";
 
 let isRestoring = false;
 let lastSyncTimestamp: string | null = null;
@@ -42,7 +41,7 @@ export const ALL_SYNC_COLLECTIONS: Array<{ key: keyof typeof db; colName: string
 ];
 
 /**
- * Get real-time database sync diagnostic stats (Cloud SQL PostgreSQL + Firebase Firestore)
+ * Get real-time database sync diagnostic stats (Primary Database: Google Cloud Firestore)
  */
 export function getSyncStats() {
   const collectionCounts: Record<string, number> = {};
@@ -54,37 +53,98 @@ export function getSyncStats() {
   const firestoreReady = !!getFirestoreDB();
 
   return {
-    databaseEngine: "Cloud SQL (PostgreSQL) + Firestore",
-    isCloudConnected: isCloudSqlHealthy() || firestoreReady,
+    databaseEngine: "Google Cloud Firestore (Primary Database)",
+    isCloudConnected: firestoreReady,
     isFirestoreReady: firestoreReady,
     isQuotaPaused: false,
     lastSyncTimestamp: lastSyncTimestamp || new Date().toISOString(),
-    lastSyncStatus: isCloudSqlHealthy() || firestoreReady ? "SUCCESS" : "ERROR",
+    lastSyncStatus: firestoreReady ? "SUCCESS" : "IDLE",
     lastSyncError: null,
     pendingDirtyDocs: 0,
-    totalLocalCollections: ALL_SYNC_COLLECTIONS.length,
-    totalLocalRecords: Object.values(collectionCounts).reduce((a, b) => a + b, 0),
+    totalCollections: ALL_SYNC_COLLECTIONS.length,
+    totalRecords: Object.values(collectionCounts).reduce((a, b) => a + b, 0),
     collectionCounts,
   };
 }
 
 /**
- * Instant Real-Time Document Upsert to Cloud SQL (PostgreSQL) and Firebase Firestore
+ * Load all collections from Cloud Firestore into in-memory DB on startup
+ */
+export async function loadAllFromFirestore(inMemoryDb: any): Promise<boolean> {
+  const fdb = getFirestoreDB();
+  if (!fdb) {
+    console.log("[Cloud Firestore] Firestore instance not initialized yet. Skipping cloud load.");
+    return false;
+  }
+
+  isRestoring = true;
+  let totalLoaded = 0;
+
+  try {
+    console.log("[Cloud Firestore] Loading persistent documents from Cloud Firestore primary database...");
+
+    for (const { key, colName } of ALL_SYNC_COLLECTIONS) {
+      try {
+        const colRef = collection(fdb, colName);
+        const snapshot = await getDocs(colRef);
+        if (!snapshot.empty) {
+          const items: any[] = [];
+          snapshot.forEach((d) => {
+            const data = d.data();
+            if (!data._id) data._id = d.id;
+            items.push(data);
+          });
+          (inMemoryDb as any)[key] = items;
+          totalLoaded += items.length;
+        }
+      } catch (colErr: any) {
+        // Continue loading remaining collections
+        if (process.env.DEBUG_SYNC) {
+          console.warn(`[Cloud Firestore Load ${colName} notice]:`, colErr?.message);
+        }
+      }
+    }
+
+    // Load company_profile & settings
+    try {
+      const snapComp = await getDocs(collection(fdb, "company_profile"));
+      if (!snapComp.empty) {
+        inMemoryDb.company_profile = snapComp.docs[0].data();
+      }
+      const snapSett = await getDocs(collection(fdb, "settings"));
+      if (!snapSett.empty) {
+        inMemoryDb.settings = snapSett.docs[0].data();
+      }
+    } catch {
+      // ignore
+    }
+
+    console.log(`[Cloud Firestore] Successfully hydrated ${totalLoaded} documents from primary Firestore database!`);
+    lastSyncTimestamp = new Date().toISOString();
+    lastSyncStatus = "SUCCESS";
+    return totalLoaded > 0;
+  } catch (err: any) {
+    console.error("[Cloud Firestore Startup Load Error]:", err?.message);
+    lastSyncStatus = "ERROR";
+    return false;
+  } finally {
+    isRestoring = false;
+  }
+}
+
+/**
+ * Instant Real-Time Document Upsert to Cloud Firestore
  */
 export async function syncSingleDoc(colName: string, docId: string, data: any) {
   if (isRestoring || !docId) return;
 
-  // 1. Sync to Cloud SQL (PostgreSQL)
-  syncToCloudSql(colName, String(docId), data);
-
-  // 2. Sync to Firebase Firestore if initialized
+  // 1. Sync to Firebase Firestore
   try {
     const fdb = getFirestoreDB();
     if (fdb) {
       const sanitized = JSON.parse(JSON.stringify(data));
       const docRef = doc(fdb, colName, String(docId));
       setDoc(docRef, sanitized, { merge: true }).catch((err) => {
-        // Log quietly without breaking flow
         if (process.env.DEBUG_SYNC) console.warn(`[Firestore Sync ${colName}/${docId}]:`, err?.message);
       });
     }
@@ -92,22 +152,19 @@ export async function syncSingleDoc(colName: string, docId: string, data: any) {
     // Non-blocking
   }
 
-  // 3. Immediately persist to disk JSON
+  // 2. Immediately persist to local disk JSON backup
   saveDatabaseToDisk();
 
   lastSyncTimestamp = new Date().toISOString();
 }
 
 /**
- * Instant Real-Time Document Deletion from Cloud SQL (PostgreSQL) and Firebase Firestore
+ * Instant Real-Time Document Deletion from Cloud Firestore
  */
 export async function deleteSingleDoc(colName: string, docId: string) {
   if (isRestoring || !docId) return;
 
-  // 1. Sync deletion to Cloud SQL
-  syncDeleteFromCloudSql(colName, String(docId));
-
-  // 2. Sync deletion to Firebase Firestore
+  // 1. Sync deletion to Firebase Firestore
   try {
     const fdb = getFirestoreDB();
     if (fdb) {
@@ -118,14 +175,14 @@ export async function deleteSingleDoc(colName: string, docId: string) {
     // Non-blocking
   }
 
-  // 3. Persist to disk JSON
+  // 2. Persist to disk JSON backup
   saveDatabaseToDisk();
 
   lastSyncTimestamp = new Date().toISOString();
 }
 
 /**
- * Synchronize local database to Cloud SQL & Firestore
+ * Synchronize all entities to Cloud Firestore
  */
 export async function syncToFirestore(immediate = false, forceAll = false) {
   if (isRestoring) return;

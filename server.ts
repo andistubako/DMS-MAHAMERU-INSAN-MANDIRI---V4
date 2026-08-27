@@ -8,20 +8,42 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { apiRouter } from "./server/routes.js";
 import { db as inMemoryDb, saveDatabaseToDisk } from "./server/data.js";
-import { loadAllFromCloudSql, testCloudSqlConnection } from "./server/cloudSqlSync.js";
+import { loadAllFromFirestore, syncToFirestore } from "./server/firestoreSync.js";
+import { initializeCloudSqlTables, migrateAllToCloudSql } from "./server/cloudsqlSync.js";
 
 async function startServer() {
-  // Test and load persistent data from Cloud SQL (PostgreSQL)
+  // Load and hydrate primary persistent data from Google Cloud Firestore
   try {
-    const isPgReady = await testCloudSqlConnection();
-    if (isPgReady) {
-      const loaded = await loadAllFromCloudSql(inMemoryDb);
-      if (loaded) {
-        saveDatabaseToDisk(true);
-      }
+    const loaded = await loadAllFromFirestore(inMemoryDb);
+    if (loaded) {
+      saveDatabaseToDisk(true);
     }
   } catch (err) {
-    console.warn("Initial Cloud SQL restore notice:", err);
+    console.warn("Initial Cloud Firestore restore notice:", err);
+  }
+
+  // Trigger Firestore synchronization in background
+  try {
+    syncToFirestore(true, true).catch((e) => {
+      console.warn("Initial Firestore sync notice:", e?.message);
+    });
+  } catch {
+    // ignore
+  }
+
+  // Trigger Cloud SQL (PostgreSQL) initialization and migration in background
+  try {
+    initializeCloudSqlTables()
+      .then((ok) => {
+        if (ok) {
+          return migrateAllToCloudSql();
+        }
+      })
+      .catch((e) => {
+        console.warn("Initial Cloud SQL setup notice:", e?.message);
+      });
+  } catch {
+    // ignore
   }
 
   const app = express();
@@ -52,7 +74,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`MAHAMERU DMS Server running on http://0.0.0.0:${PORT} [Connected to Cloud SQL PostgreSQL]`);
+    console.log(`MAHAMERU DMS Server running on http://0.0.0.0:${PORT} [Primary Database: Google Cloud Firestore]`);
   });
 }
 

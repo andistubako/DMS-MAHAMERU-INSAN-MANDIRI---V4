@@ -205,9 +205,40 @@ export default function Login() {
               </button>
             </form>
 
+            {/* Quick Demo Login Switcher */}
+            <div className="pt-3 border-t border-slate-100 space-y-2">
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider text-center">
+                Akses Cepat Demo
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail("andismochsolihin@gmail.com");
+                    setPassword("owner123");
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-semibold text-navy text-left transition-colors"
+                >
+                  👑 Owner
+                  <div className="text-[9px] text-slate-400 truncate">andismoch...</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail("admin@mahameru.id");
+                    setPassword("admin123");
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-semibold text-navy text-left transition-colors"
+                >
+                  ⚡ Admin
+                  <div className="text-[9px] text-slate-400 truncate">admin@mahameru.id</div>
+                </button>
+              </div>
+            </div>
+
             {/* Support info from settings */}
             {(companyProfile?.companyEmail || companyProfile?.companyPhone) && (
-              <div className="pt-4 border-t border-slate-100 text-center text-[11px] text-slate-400">
+              <div className="pt-2 text-center text-[11px] text-slate-400">
                 Butuh bantuan login? Hubungi{" "}
                 <span className="font-semibold text-slate-600">
                   {companyProfile.companyPhone || companyProfile.companyEmail}

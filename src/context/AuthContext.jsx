@@ -57,12 +57,24 @@ export function AuthProvider({ children }) {
     return res.data;
   };
 
+  const refreshUser = async () => {
+    try {
+      const { data } = await api.get("/auth/me");
+      setUser(data);
+      return data;
+    } catch (e) {
+      console.warn("Gagal memperbarui data user:", e);
+      return null;
+    }
+  };
+
   const changePassword = async (newPassword, oldPassword) => {
     await api.post("/auth/change-password", { old_password: oldPassword, new_password: newPassword });
+    await refreshUser();
   };
 
   const value = useMemo(
-    () => ({ user, loading, login, logout, forgotPassword, changePassword }),
+    () => ({ user, loading, login, logout, forgotPassword, changePassword, refreshUser }),
     [user, loading]
   );
 
