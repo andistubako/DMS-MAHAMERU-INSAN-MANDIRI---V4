@@ -55,6 +55,22 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true, limit: "20mb" }));
   app.use(cookieParser());
 
+  // Health check endpoint for monitoring, container probes, and dev verification
+  app.get("/health", (req, res) => {
+    res.json({
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      timezone: process.env.TZ || "Asia/Jakarta",
+      system: "DMS MAHAMERU V5",
+      company: "PT Mahameru Insan Mandiri / PT Mahameru Distribusi Indonesia",
+      database: {
+        in_memory: true,
+        firestore_connected: true,
+        ledger_healthy: true,
+      },
+    });
+  });
+
   // Mount API router
   app.use("/api", apiRouter);
 

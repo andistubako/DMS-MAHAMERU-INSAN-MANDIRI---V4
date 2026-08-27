@@ -22,8 +22,15 @@ import {
   StockReceivingItem,
   SalesStockLedger,
   Target,
+  CashDeposit,
+  Receivable,
+  ReceivablePayment,
+  DailyReconciliationRecord,
   saveDatabaseToDisk,
   auditAndRepairDatabase,
+  executeWithMutex,
+  checkIdempotency,
+  recordIdempotency,
 } from "./data.js";
 import { syncToFirestore, getSyncStats, deleteSingleDoc, syncSingleDoc, ALL_SYNC_COLLECTIONS } from "./firestoreSync.js";
 import { migrateAllToCloudSql, getCloudSqlStats, initializeCloudSqlTables } from "./cloudsqlSync.js";
@@ -4228,10 +4235,17 @@ apiRouter.get("/transactions/sku-list", authMiddleware, (req: AuthenticatedReque
   res.json({ items: skus, total: skus.length });
 });
 
-apiRouter.post("/transactions", authMiddleware, (req: AuthenticatedRequest, res) => {
+apiRouter.post("/transactions", authMiddleware, async (req: AuthenticatedRequest, res) => {
   const { outlet_id, visit_id, items, payment_method } = req.body || {};
   if (!outlet_id || !items || !items.length) {
     return res.status(400).json({ detail: "Outlet dan daftar item produk wajib diisi." });
+  }
+
+  // Check Idempotency to prevent duplicate transaction submissions
+  const idempotencyKey = (req.headers["x-idempotency-key"] as string) || req.body?.idempotency_key;
+  const idempCheck = checkIdempotency(idempotencyKey);
+  if (idempCheck.isDuplicate) {
+    return res.json(idempCheck.cachedResponse);
   }
 
   // 1. Validate user status
@@ -4265,174 +4279,221 @@ apiRouter.post("/transactions", authMiddleware, (req: AuthenticatedRequest, res)
     }
   }
 
-  // 4. VALIDATE SALES STOCK (STOK SALES DI LAPANGAN)
-  // Stok yang dijual harus berasal dari stok yang dibawa sales (bukan langsung gudang)
   const salesmanId = req.user!._id;
-  for (const it of items) {
-    const qty = parseInt(it.quantity) || 0;
-    if (qty <= 0) {
-      return res.status(400).json({ detail: "Jumlah kuantitas item harus lebih dari 0." });
-    }
+  const lockKey = `stock_lock_${salesmanId}`;
 
-    if (req.user!.role === "SALES") {
-      const salesInv = db.inventory.find(
-        (i) => i.location_type === "SALES" && i.location_id === salesmanId && i.sku_id === it.sku_id
-      );
-      const availableSalesStock = salesInv ? salesInv.available_stock : 0;
-      if (availableSalesStock < qty) {
+  try {
+    const result = await executeWithMutex(lockKey, async () => {
+      // 4. VALIDATE SALES STOCK (STOK SALES DI LAPANGAN) under lock
+      for (const it of items) {
+        const qty = parseInt(it.quantity) || 0;
+        if (qty <= 0) {
+          throw { status: 400, detail: "Jumlah kuantitas item harus lebih dari 0." };
+        }
+
+        if (req.user!.role === "SALES") {
+          const salesInv = db.inventory.find(
+            (i) => i.location_type === "SALES" && i.location_id === salesmanId && i.sku_id === it.sku_id
+          );
+          const availableSalesStock = salesInv ? salesInv.available_stock : 0;
+          if (availableSalesStock < qty) {
+            const sku = db.skus.find((s) => s._id === it.sku_id);
+            throw {
+              status: 400,
+              detail: `Stok produk "${sku?.name || it.sku_id}" tidak mencukupi pada Sales. Sisa stok yang Anda bawa: ${availableSalesStock} ${sku?.unit || "Unit"}, Diminta: ${qty} ${sku?.unit || "Unit"}.`,
+              code: "INSUFFICIENT_SALES_STOCK",
+            };
+          }
+        }
+      }
+
+      const today = getTodayWIB();
+      const count = db.transactions.length + 1;
+      const invoiceNumber = `INV/${today.replace(/-/g, "")}/${String(count).padStart(3, "0")}`;
+      const newTxnId = `txn-${Date.now()}`;
+
+      let subtotal = 0;
+      const processedItems = items.map((it: any, idx: number) => {
         const sku = db.skus.find((s) => s._id === it.sku_id);
-        return res.status(400).json({
-          detail: `Stok produk "${sku?.name || it.sku_id}" tidak mencukupi pada Sales. Sisa stok yang Anda bawa: ${availableSalesStock} ${sku?.unit || "Unit"}, Diminta: ${qty} ${sku?.unit || "Unit"}.`,
-          code: "INSUFFICIENT_SALES_STOCK",
+        const prod = db.products.find((p) => p._id === sku?.product_id);
+        const prc = db.prices.find((p) => p.sku_id === it.sku_id);
+        const price = Number(it.unit_price ?? it.unitPrice ?? prc?.price ?? 0);
+        const qty = parseInt(it.quantity ?? it.volume ?? it.qty, 10) || 1;
+        const disc = parseFloat(it.discount) || 0;
+        const itemTotal = price * qty - disc;
+        subtotal += itemTotal;
+
+        // Deduct stock from SALES inventory (or warehouse fallback if non-sales admin testing)
+        if (req.user!.role === "SALES") {
+          let salesInv = db.inventory.find(
+            (i) => i.location_type === "SALES" && i.location_id === salesmanId && i.sku_id === it.sku_id
+          );
+          if (salesInv) {
+            salesInv.stock_on_hand = Math.max(0, salesInv.stock_on_hand - qty);
+            salesInv.available_stock = Math.max(0, salesInv.available_stock - qty);
+            salesInv.updated_at = new Date().toISOString();
+          }
+
+          // Record official SALES_OUT stock movement
+          const mvtCount = db.stock_movements.length + 1 + idx;
+          db.stock_movements.push({
+            _id: `mvt-${Date.now()}-${idx}`,
+            movement_code: `MVT-${today.replace(/-/g, "")}-${String(mvtCount).padStart(4, "0")}`,
+            movement_type: "SALES_OUT",
+            source_location_type: "SALES",
+            source_location_id: salesmanId,
+            destination_location_type: "OUTLET",
+            destination_location_id: outlet_id,
+            sku_id: it.sku_id,
+            quantity: qty,
+            salesman_id: salesmanId,
+            outlet_id,
+            reference_id: newTxnId,
+            business_date: today,
+            status: "COMPLETED",
+            notes: `Penjualan ${outlet.outlet_name} (${invoiceNumber}) - Volume: ${qty} ${sku?.unit || 'Unit'}`,
+            created_by: salesmanId,
+            created_at: new Date().toISOString(),
+          });
+        } else {
+          // Non-sales fallback (e.g. admin test order)
+          const whInv = db.inventory.find(
+            (i) => (i.location_type === "WAREHOUSE" || !i.location_type) && i.sku_id === it.sku_id
+          );
+          if (whInv) {
+            whInv.stock_on_hand = Math.max(0, whInv.stock_on_hand - qty);
+            whInv.available_stock = Math.max(0, whInv.available_stock - qty);
+            whInv.updated_at = new Date().toISOString();
+          }
+        }
+
+        return {
+          transaction_id: newTxnId,
+          transactionId: newTxnId,
+          product_id: prod?._id || sku?.product_id || "prd-1",
+          productId: prod?._id || sku?.product_id || "prd-1",
+          sku_id: it.sku_id,
+          skuId: it.sku_id,
+          product_name: prod?.name || "Produk",
+          productName: prod?.name || "Produk",
+          sku_name: sku?.name || it.sku_name || "SKU",
+          skuName: sku?.name || it.sku_name || "SKU",
+          quantity: qty,
+          qty: qty,
+          volume: qty, // Volume is strictly Qty of this SKU
+          unit_price: price,
+          unitPrice: price,
+          discount: disc,
+          subtotal: itemTotal,
+        };
+      });
+
+      const totalVolume = processedItems.reduce((acc, it) => acc + (it.volume || it.quantity), 0);
+      const isCredit = payment_method === "CREDIT" || payment_method === "TEMPO";
+
+      const newTxn: Transaction = {
+        _id: newTxnId,
+        transaction_code: invoiceNumber,
+        invoice_number: invoiceNumber,
+        salesman_id: req.user!._id,
+        outlet_id,
+        visit_id: visit_id || "",
+        transaction_date: new Date().toISOString(),
+        items: processedItems,
+        total_volume: totalVolume,
+        subtotal,
+        discount_total: 0,
+        tax: 0,
+        total: subtotal,
+        payment_method: isCredit ? "CREDIT" : (payment_method || "CASH"),
+        status: isCredit ? "PENDING" : "PAID",
+        created_at: new Date().toISOString(),
+      };
+
+      db.transactions.push(newTxn);
+      syncSingleDoc("transactions", newTxn._id, newTxn);
+
+      // Create Accounts Receivable record if payment is CREDIT
+      if (isCredit) {
+        const defaultTermDays = Number((outlet as any).payment_terms_days || db.settings.default_payment_term_days || 14);
+        const due = new Date();
+        due.setDate(due.getDate() + defaultTermDays);
+        const dueDateStr = due.toISOString().slice(0, 10);
+
+        const newRec: Receivable = {
+          _id: `rec-${newTxnId}`,
+          invoice_id: newTxnId,
+          invoice_number: invoiceNumber,
+          outlet_id,
+          salesman_id: req.user!._id,
+          due_date: dueDateStr,
+          total_amount: subtotal,
+          paid_amount: 0,
+          remaining_amount: subtotal,
+          status: "UNPAID",
+          payments: [],
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        db.receivables.push(newRec);
+        syncSingleDoc("receivables", newRec._id, newRec);
+      }
+
+      // Recalculate outlet lifecycle status & metrics immediately
+      recalculateOutletSummary(outlet_id);
+      const updatedOutlet = db.outlets.find((o) => o._id === outlet_id);
+      if (updatedOutlet) syncSingleDoc("outlets", updatedOutlet._id, updatedOutlet);
+
+      // Synchronize Sales Stock Ledger for each SKU sold
+      if (req.user!.role === "SALES") {
+        items.forEach((it: any) => {
+          syncSalesStockLedger(salesmanId, it.sku_id, today);
         });
       }
-    }
-  }
 
-  const today = getTodayWIB();
-  const count = db.transactions.length + 1;
-  const invoiceNumber = `INV/${today.replace(/-/g, "")}/${String(count).padStart(3, "0")}`;
-  const newTxnId = `txn-${Date.now()}`;
-
-  let subtotal = 0;
-  const processedItems = items.map((it: any, idx: number) => {
-    const sku = db.skus.find((s) => s._id === it.sku_id);
-    const prod = db.products.find((p) => p._id === sku?.product_id);
-    const prc = db.prices.find((p) => p.sku_id === it.sku_id);
-    const price = Number(it.unit_price ?? it.unitPrice ?? prc?.price ?? 0);
-    const qty = parseInt(it.quantity ?? it.volume ?? it.qty, 10) || 1;
-    const disc = parseFloat(it.discount) || 0;
-    const itemTotal = price * qty - disc;
-    subtotal += itemTotal;
-
-    // Deduct stock from SALES inventory (or warehouse fallback if non-sales admin testing)
-    if (req.user!.role === "SALES") {
-      let salesInv = db.inventory.find(
-        (i) => i.location_type === "SALES" && i.location_id === salesmanId && i.sku_id === it.sku_id
-      );
-      if (salesInv) {
-        salesInv.stock_on_hand = Math.max(0, salesInv.stock_on_hand - qty);
-        salesInv.available_stock = Math.max(0, salesInv.available_stock - qty);
-        salesInv.updated_at = new Date().toISOString();
+      // If inside a visit, mark visit as effective
+      if (visit_id) {
+        const visit = db.visits.find((v) => v._id === visit_id);
+        if (visit) {
+          visit.call_result = "EFFECTIVE";
+          visit.total_sales = (visit.total_sales || 0) + subtotal;
+        }
       }
 
-      // Record official SALES_OUT stock movement
-      const mvtCount = db.stock_movements.length + 1 + idx;
-      db.stock_movements.push({
-        _id: `mvt-${Date.now()}-${idx}`,
-        movement_code: `MVT-${today.replace(/-/g, "")}-${String(mvtCount).padStart(4, "0")}`,
-        movement_type: "SALES_OUT",
-        source_location_type: "SALES",
-        source_location_id: salesmanId,
-        destination_location_type: "OUTLET",
-        destination_location_id: outlet_id,
-        sku_id: it.sku_id,
-        quantity: qty,
-        salesman_id: salesmanId,
-        outlet_id,
-        reference_id: newTxnId,
-        business_date: today,
-        status: "COMPLETED",
-        notes: `Penjualan ${outlet.outlet_name} (${invoiceNumber}) - Volume: ${qty} ${sku?.unit || 'Unit'}`,
-        created_by: salesmanId,
-        created_at: new Date().toISOString(),
-      });
-    } else {
-      // Non-sales fallback (e.g. admin test order)
-      const whInv = db.inventory.find(
-        (i) => (i.location_type === "WAREHOUSE" || !i.location_type) && i.sku_id === it.sku_id
+      recordAuditLog(
+        req.user!._id,
+        "CREATE_TRANSACTION",
+        "transactions",
+        newTxn._id,
+        {
+          invoice: invoiceNumber,
+          outlet_id,
+          total_volume: totalVolume,
+          total: subtotal,
+          payment_method: newTxn.payment_method,
+          items: processedItems.map((i) => ({ sku: i.sku_name, volume: i.volume, subtotal: i.subtotal })),
+        }
       );
-      if (whInv) {
-        whInv.stock_on_hand = Math.max(0, whInv.stock_on_hand - qty);
-        whInv.available_stock = Math.max(0, whInv.available_stock - qty);
-        whInv.updated_at = new Date().toISOString();
+
+      const responsePayload = {
+        message: "Transaksi penjualan berhasil disimpan dan stok sales berhasil dimutasi.",
+        transaction: newTxn,
+      };
+
+      if (idempotencyKey) {
+        recordIdempotency(idempotencyKey, responsePayload);
       }
-    }
 
-    return {
-      transaction_id: newTxnId,
-      transactionId: newTxnId,
-      product_id: prod?._id || sku?.product_id || "prd-1",
-      productId: prod?._id || sku?.product_id || "prd-1",
-      sku_id: it.sku_id,
-      skuId: it.sku_id,
-      product_name: prod?.name || "Produk",
-      productName: prod?.name || "Produk",
-      sku_name: sku?.name || it.sku_name || "SKU",
-      skuName: sku?.name || it.sku_name || "SKU",
-      quantity: qty,
-      qty: qty,
-      volume: qty, // Volume is strictly Qty of this SKU
-      unit_price: price,
-      unitPrice: price,
-      discount: disc,
-      subtotal: itemTotal,
-    };
-  });
-
-  const totalVolume = processedItems.reduce((acc, it) => acc + (it.volume || it.quantity), 0);
-
-  const newTxn: Transaction = {
-    _id: newTxnId,
-    transaction_code: invoiceNumber,
-    invoice_number: invoiceNumber,
-    salesman_id: req.user!._id,
-    outlet_id,
-    visit_id: visit_id || "",
-    transaction_date: new Date().toISOString(),
-    items: processedItems,
-    total_volume: totalVolume,
-    subtotal,
-    discount_total: 0,
-    tax: 0,
-    total: subtotal,
-    payment_method: payment_method || "CASH",
-    status: "PAID",
-    created_at: new Date().toISOString(),
-  };
-
-  db.transactions.push(newTxn);
-  syncSingleDoc("transactions", newTxn._id, newTxn);
-
-  // Recalculate outlet lifecycle status & metrics immediately
-  recalculateOutletSummary(outlet_id);
-  const updatedOutlet = db.outlets.find((o) => o._id === outlet_id);
-  if (updatedOutlet) syncSingleDoc("outlets", updatedOutlet._id, updatedOutlet);
-
-  // Synchronize Sales Stock Ledger for each SKU sold
-  if (req.user!.role === "SALES") {
-    items.forEach((it: any) => {
-      syncSalesStockLedger(salesmanId, it.sku_id, today);
+      return responsePayload;
     });
-  }
 
-  // If inside a visit, mark visit as effective
-  if (visit_id) {
-    const visit = db.visits.find((v) => v._id === visit_id);
-    if (visit) {
-      visit.call_result = "EFFECTIVE";
-      visit.total_sales = (visit.total_sales || 0) + subtotal;
+    res.status(201).json(result);
+  } catch (err: any) {
+    if (err.status) {
+      return res.status(err.status).json({ detail: err.detail, code: err.code });
     }
+    res.status(500).json({ detail: err.message || "Gagal memproses transaksi penjualan." });
   }
-
-  recordAuditLog(
-    req.user!._id,
-    "CREATE_TRANSACTION",
-    "transactions",
-    newTxn._id,
-    {
-      invoice: invoiceNumber,
-      outlet_id,
-      total_volume: totalVolume,
-      total: subtotal,
-      items: processedItems.map((i) => ({ sku: i.sku_name, volume: i.volume, subtotal: i.subtotal })),
-    }
-  );
-
-  res.status(201).json({
-    message: "Transaksi penjualan berhasil disimpan dan stok sales berhasil dimutasi.",
-    transaction: newTxn,
-  });
 });
 
 apiRouter.get("/transactions", authMiddleware, (req: AuthenticatedRequest, res) => {
@@ -11036,5 +11097,526 @@ apiRouter.delete("/sales-outlets/:id", authMiddleware, requireRoles("ADMIN", "OW
   res.json({
     message: `Penugasan outlet "${outlet?.outlet_name || assignment.outlet_id}" kepada ${sales?.name || assignment.sales_id} berhasil dinonaktifkan.`,
     assignment,
+  });
+});
+
+// ================= TRANSACTION VOID (ALIAS WITH RECEIVABLE VOID) =================
+apiRouter.post("/transactions/:id/void", authMiddleware, requireRoles("SUPERVISOR", "ADMIN", "OWNER", "SALES"), (req: AuthenticatedRequest, res) => {
+  const txn = db.transactions.find((t) => t._id === req.params.id || t.invoice_number === req.params.id);
+  if (!txn) return res.status(404).json({ detail: "Transaksi tidak ditemukan." });
+  if (req.user!.role === "SALES" && txn.salesman_id !== req.user!._id) {
+    return res.status(403).json({ detail: "Akses ditolak. Anda hanya dapat membatalkan transaksi milik Anda sendiri." });
+  }
+  if (txn.status === "CANCELLED") return res.status(400).json({ detail: "Transaksi sudah dibatalkan sebelumnya." });
+
+  const { reason } = req.body || {};
+  if (!reason) return res.status(400).json({ detail: "Alasan void/pembatalan transaksi wajib diisi." });
+
+  txn.status = "CANCELLED";
+  const today = getTodayWIB();
+
+  // Reverse stock back to salesman
+  (txn.items || []).forEach((it: any, idx: number) => {
+    const qty = Number(it.quantity ?? it.volume ?? 0);
+    let salesInv = db.inventory.find(
+      (i) => i.location_type === "SALES" && i.location_id === txn.salesman_id && i.sku_id === it.sku_id
+    );
+    if (salesInv) {
+      salesInv.stock_on_hand += qty;
+      salesInv.available_stock += qty;
+      salesInv.updated_at = new Date().toISOString();
+    }
+
+    db.stock_movements.push({
+      _id: `mvt-rev-${Date.now()}-${idx}`,
+      movement_code: `MVT-REV-${today.replace(/-/g, "")}-${String(db.stock_movements.length + 1).padStart(4, "0")}`,
+      movement_type: "REVERSAL",
+      source_location_type: "OUTLET",
+      source_location_id: txn.outlet_id,
+      destination_location_type: "SALES",
+      destination_location_id: txn.salesman_id,
+      sku_id: it.sku_id,
+      quantity: qty,
+      salesman_id: txn.salesman_id,
+      outlet_id: txn.outlet_id,
+      reference_id: txn._id,
+      business_date: today,
+      status: "COMPLETED",
+      notes: `Void/Reversal pembatalan ${txn.invoice_number || txn._id}: ${reason}`,
+      created_by: req.user!._id,
+      created_at: new Date().toISOString(),
+    });
+
+    syncSalesStockLedger(txn.salesman_id, it.sku_id, today);
+  });
+
+  // Cancel associated receivable if exists
+  const rec = (db.receivables || []).find((r) => r.invoice_id === txn._id || r.invoice_number === txn.invoice_number);
+  if (rec) {
+    rec.status = "OVERDUE";
+    syncSingleDoc("receivables", rec._id, rec);
+  }
+
+  recalculateOutletSummary(txn.outlet_id);
+  const updatedOutlet = db.outlets.find((o) => o._id === txn.outlet_id);
+  if (updatedOutlet) syncSingleDoc("outlets", updatedOutlet._id, updatedOutlet);
+  syncSingleDoc("transactions", txn._id, txn);
+
+  recordAuditLog(
+    req.user!._id,
+    "VOID_TRANSACTION",
+    "transactions",
+    txn._id,
+    {
+      invoice_number: txn.invoice_number,
+      outlet_id: txn.outlet_id,
+      reason,
+      items: txn.items,
+    }
+  );
+
+  res.json({
+    message: `Transaksi ${txn.invoice_number || txn._id} berhasil di-void dan stok sales berhasil dikembalikan.`,
+    transaction: txn,
+  });
+});
+
+// ================= NOO (NEW OUTLET OPENING) APPROVAL WORKFLOW =================
+apiRouter.post("/outlets/:id/approve", authMiddleware, requireRoles("SUPERVISOR", "ADMIN", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const outlet = db.outlets.find((o) => o._id === req.params.id);
+  if (!outlet) return res.status(404).json({ detail: "Outlet tidak ditemukan." });
+
+  outlet.status = "ACTIVE";
+  outlet.lifecycle_status = "REGISTERED";
+  (outlet as any).approved_by = req.user!._id;
+  (outlet as any).approved_at = new Date().toISOString();
+  outlet.updated_at = new Date().toISOString();
+
+  syncSingleDoc("outlets", outlet._id, outlet);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "APPROVE_OUTLET_NOO",
+    "outlets",
+    outlet._id,
+    { outlet_code: outlet.outlet_code, outlet_name: outlet.outlet_name }
+  );
+
+  res.json({
+    message: `Outlet "${outlet.outlet_name}" (${outlet.outlet_code}) berhasil disetujui.`,
+    outlet,
+  });
+});
+
+apiRouter.post("/outlets/:id/reject", authMiddleware, requireRoles("SUPERVISOR", "ADMIN", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const outlet = db.outlets.find((o) => o._id === req.params.id);
+  if (!outlet) return res.status(404).json({ detail: "Outlet tidak ditemukan." });
+
+  const { reason } = req.body || {};
+  outlet.status = "INACTIVE";
+  outlet.lifecycle_status = "INACTIVE";
+  (outlet as any).rejection_reason = reason || "Ditolak saat verifikasi NOO";
+  (outlet as any).rejected_by = req.user!._id;
+  (outlet as any).rejected_at = new Date().toISOString();
+  outlet.updated_at = new Date().toISOString();
+
+  syncSingleDoc("outlets", outlet._id, outlet);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "REJECT_OUTLET_NOO",
+    "outlets",
+    outlet._id,
+    { outlet_code: outlet.outlet_code, outlet_name: outlet.outlet_name, reason }
+  );
+
+  res.json({
+    message: `Pendaftaran outlet "${outlet.outlet_name}" telah ditolak.`,
+    outlet,
+  });
+});
+
+// ================= CASH SETTLEMENT / DEPOSITS (SETORAN UANG SALES) =================
+apiRouter.get("/deposits", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const salesmanId = req.user!.role === "SALES" ? req.user!._id : (req.query.salesman_id as string);
+  const businessDate = req.query.business_date as string;
+  const status = req.query.status as string;
+
+  let deposits = (db.cash_deposits || []).filter((d) => {
+    if (salesmanId && d.salesman_id !== salesmanId) return false;
+    if (businessDate && d.business_date !== businessDate) return false;
+    if (status && d.status !== status) return false;
+    return true;
+  });
+
+  const enriched = deposits.map((d) => {
+    const sales = db.users.find((u) => u._id === d.salesman_id);
+    const verifier = d.verified_by ? db.users.find((u) => u._id === d.verified_by) : null;
+    return {
+      ...d,
+      salesman_name: sales?.name || "-",
+      salesman_code: (sales as any)?.code || d.salesman_id,
+      verified_by_name: verifier?.name || "-",
+    };
+  });
+
+  res.json({ items: enriched, total: enriched.length });
+});
+
+apiRouter.post("/deposits", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const { salesman_id, business_date, actual_deposit_amount, notes } = req.body || {};
+  const targetSalesmanId = req.user!.role === "SALES" ? req.user!._id : (salesman_id || req.user!._id);
+  const targetDate = business_date || getTodayWIB();
+  const actualDeposit = Number(actual_deposit_amount || 0);
+
+  if (actualDeposit < 0) {
+    return res.status(400).json({ detail: "Nominal setoran tidak valid." });
+  }
+
+  // Calculate expected cash from cash sales today
+  const cashSalesToday = db.transactions
+    .filter(
+      (t) =>
+        t.salesman_id === targetSalesmanId &&
+        t.transaction_date.startsWith(targetDate) &&
+        t.status !== "CANCELLED" &&
+        (t.payment_method === "CASH" || !t.payment_method)
+    )
+    .reduce((sum, t) => sum + (t.total || 0), 0);
+
+  // Add collection of receivables collected by this salesman today
+  let collectionsToday = 0;
+  (db.receivables || []).forEach((r) => {
+    (r.payments || []).forEach((p) => {
+      if (p.received_by === targetSalesmanId && p.payment_date.startsWith(targetDate) && p.payment_method === "CASH") {
+        collectionsToday += p.amount;
+      }
+    });
+  });
+
+  const expectedCash = cashSalesToday + collectionsToday;
+  const variance = actualDeposit - expectedCash;
+
+  const count = (db.cash_deposits || []).length + 1;
+  const depositCode = `DEP/${targetDate.replace(/-/g, "")}/${String(count).padStart(3, "0")}`;
+
+  const newDeposit: CashDeposit = {
+    _id: `dep-${Date.now()}`,
+    deposit_code: depositCode,
+    salesman_id: targetSalesmanId,
+    business_date: targetDate,
+    expected_cash_amount: expectedCash,
+    actual_deposit_amount: actualDeposit,
+    variance_amount: variance,
+    notes: notes || "",
+    status: req.user!.role === "ADMIN" || req.user!.role === "OWNER" ? "VERIFIED" : "PENDING",
+    verified_by: req.user!.role === "ADMIN" || req.user!.role === "OWNER" ? req.user!._id : undefined,
+    verified_at: req.user!.role === "ADMIN" || req.user!.role === "OWNER" ? new Date().toISOString() : undefined,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  db.cash_deposits.push(newDeposit);
+  syncSingleDoc("cash_deposits", newDeposit._id, newDeposit);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "CREATE_CASH_DEPOSIT",
+    "cash_deposits",
+    newDeposit._id,
+    {
+      deposit_code: depositCode,
+      salesman_id: targetSalesmanId,
+      expected: expectedCash,
+      actual: actualDeposit,
+      variance,
+    }
+  );
+
+  res.status(201).json({
+    message: `Setoran kas ${depositCode} berhasil dicatat. ${variance === 0 ? "Nominal Uang Sesuai (BALANCED)." : `Terdapat selisih kas Rp ${variance.toLocaleString("id-ID")}`}`,
+    deposit: newDeposit,
+  });
+});
+
+apiRouter.post("/deposits/:id/verify", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER", "WAREHOUSE"), (req: AuthenticatedRequest, res) => {
+  const deposit = (db.cash_deposits || []).find((d) => d._id === req.params.id);
+  if (!deposit) return res.status(404).json({ detail: "Data setoran tidak ditemukan." });
+
+  const { status, notes } = req.body || {};
+  deposit.status = status === "REJECTED" ? "REJECTED" : "VERIFIED";
+  deposit.verified_by = req.user!._id;
+  deposit.verified_at = new Date().toISOString();
+  if (notes) deposit.notes = (deposit.notes ? deposit.notes + " | " : "") + notes;
+  deposit.updated_at = new Date().toISOString();
+
+  syncSingleDoc("cash_deposits", deposit._id, deposit);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "VERIFY_CASH_DEPOSIT",
+    "cash_deposits",
+    deposit._id,
+    { deposit_code: deposit.deposit_code, status: deposit.status, notes }
+  );
+
+  res.json({
+    message: `Setoran kas ${deposit.deposit_code} berhasil diverifikasi (${deposit.status}).`,
+    deposit,
+  });
+});
+
+// ================= ACCOUNTS RECEIVABLE / PIUTANG DAGANG =================
+apiRouter.get("/receivables", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const salesmanId = req.user!.role === "SALES" ? req.user!._id : (req.query.salesman_id as string);
+  const outletId = req.query.outlet_id as string;
+  const status = req.query.status as string;
+
+  let recs = (db.receivables || []).filter((r) => {
+    if (salesmanId && r.salesman_id !== salesmanId) return false;
+    if (outletId && r.outlet_id !== outletId) return false;
+    if (status && r.status !== status) return false;
+    return true;
+  });
+
+  const todayStr = getTodayWIB();
+
+  const enriched = recs.map((r) => {
+    const outlet = db.outlets.find((o) => o._id === r.outlet_id);
+    const sales = db.users.find((u) => u._id === r.salesman_id);
+    const isOverdue = r.remaining_amount > 0 && r.due_date < todayStr;
+    const currentStatus = r.remaining_amount <= 0 ? "PAID" : (isOverdue ? "OVERDUE" : (r.paid_amount > 0 ? "PARTIAL" : "UNPAID"));
+
+    return {
+      ...r,
+      status: currentStatus,
+      outlet_name: outlet?.outlet_name || "-",
+      outlet_code: outlet?.outlet_code || "-",
+      salesman_name: sales?.name || "-",
+      salesman_code: (sales as any)?.code || r.salesman_id,
+    };
+  });
+
+  const totalOutstanding = enriched.reduce((sum, r) => sum + r.remaining_amount, 0);
+  const totalPaid = enriched.reduce((sum, r) => sum + r.paid_amount, 0);
+
+  res.json({
+    items: enriched,
+    total: enriched.length,
+    summary: {
+      total_outstanding: totalOutstanding,
+      total_paid: totalPaid,
+      overdue_count: enriched.filter((r) => r.status === "OVERDUE").length,
+    },
+  });
+});
+
+apiRouter.post("/receivables/:id/payments", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const rec = (db.receivables || []).find((r) => r._id === req.params.id);
+  if (!rec) return res.status(404).json({ detail: "Faktur piutang tidak ditemukan." });
+
+  const { amount, payment_method, reference_no, notes } = req.body || {};
+  const payAmount = Number(amount || 0);
+  if (payAmount <= 0) {
+    return res.status(400).json({ detail: "Nominal pembayaran harus lebih dari 0." });
+  }
+  if (payAmount > rec.remaining_amount) {
+    return res.status(400).json({ detail: `Nominal pembayaran melebihi sisa piutang (Sisa: Rp ${rec.remaining_amount.toLocaleString("id-ID")}).` });
+  }
+
+  const now = new Date().toISOString();
+  const paymentRecord: ReceivablePayment = {
+    _id: `pay-${Date.now()}`,
+    payment_code: `PAY/${getTodayWIB().replace(/-/g, "")}/${String((rec.payments || []).length + 1).padStart(3, "0")}`,
+    amount: payAmount,
+    payment_date: now,
+    payment_method: payment_method || "CASH",
+    reference_no: reference_no || "",
+    received_by: req.user!._id,
+    notes: notes || "",
+    created_at: now,
+  };
+
+  if (!rec.payments) rec.payments = [];
+  rec.payments.push(paymentRecord);
+  rec.paid_amount += payAmount;
+  rec.remaining_amount = Math.max(0, rec.total_amount - rec.paid_amount);
+  rec.status = rec.remaining_amount <= 0 ? "PAID" : "PARTIAL";
+  rec.updated_at = now;
+
+  syncSingleDoc("receivables", rec._id, rec);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "RECORD_RECEIVABLE_PAYMENT",
+    "receivables",
+    rec._id,
+    {
+      invoice_number: rec.invoice_number,
+      payment_code: paymentRecord.payment_code,
+      amount: payAmount,
+      remaining: rec.remaining_amount,
+    }
+  );
+
+  res.status(201).json({
+    message: `Pembayaran piutang Rp ${payAmount.toLocaleString("id-ID")} berhasil dicatat. Sisa piutang: Rp ${rec.remaining_amount.toLocaleString("id-ID")}`,
+    receivable: rec,
+    payment: paymentRecord,
+  });
+});
+
+// ================= TRIANGULAR RECONCILIATION (BARANG + PENJUALAN + UANG) =================
+apiRouter.get("/reconciliations/daily", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const business_date = (req.query.business_date as string) || getTodayWIB();
+  const salesman_id = req.user!.role === "SALES" ? req.user!._id : (req.query.salesman_id as string);
+
+  const targetUsers = salesman_id
+    ? db.users.filter((u) => u._id === salesman_id)
+    : db.users.filter((u) => u.role === "SALES" && u.status === "ACTIVE");
+
+  const results = targetUsers.map((sales) => {
+    // 1. Stock Reconciliation per SKU
+    const stockItems = db.skus.filter((s) => s.status === "ACTIVE").map((sku) => {
+      const brought = db.stock_movements
+        .filter((m) => m.business_date === business_date && m.salesman_id === sales._id && m.sku_id === sku._id && m.movement_type === "TRANSFER_IN")
+        .reduce((sum, m) => sum + m.quantity, 0);
+
+      const sold = db.stock_movements
+        .filter((m) => m.business_date === business_date && m.salesman_id === sales._id && m.sku_id === sku._id && m.movement_type === "SALES_OUT")
+        .reduce((sum, m) => sum + m.quantity, 0);
+
+      const returned = db.stock_movements
+        .filter((m) => m.business_date === business_date && m.salesman_id === sales._id && m.sku_id === sku._id && m.movement_type === "RETURN_IN")
+        .reduce((sum, m) => sum + m.quantity, 0);
+
+      const salesInv = db.inventory.find((i) => i.location_type === "SALES" && i.location_id === sales._id && i.sku_id === sku._id);
+      const actualRemaining = salesInv ? salesInv.available_stock : 0;
+      const theoreticalRemaining = Math.max(0, brought - sold - returned);
+      const variance = actualRemaining - theoreticalRemaining;
+
+      return {
+        sku_id: sku._id,
+        sku_name: sku.name,
+        sku_code: sku.code,
+        unit: sku.unit || "Unit",
+        stok_awal_handover: brought,
+        stok_terjual: sold,
+        stok_retur: returned,
+        stok_akhir_teoretis: theoreticalRemaining,
+        stok_akhir_fisik: actualRemaining,
+        variance,
+        status: variance === 0 ? "BALANCED" : (variance > 0 ? "SURPLUS" : "DEFICIT"),
+      };
+    }).filter((it) => it.stok_awal_handover > 0 || it.stok_terjual > 0 || it.stok_retur > 0 || it.stok_akhir_fisik > 0);
+
+    const totalStockVariance = stockItems.reduce((sum, it) => sum + Math.abs(it.variance), 0);
+
+    // 2. Cash Reconciliation
+    const cashSales = db.transactions
+      .filter((t) => t.salesman_id === sales._id && t.transaction_date.startsWith(business_date) && t.status !== "CANCELLED" && (t.payment_method === "CASH" || !t.payment_method))
+      .reduce((sum, t) => sum + (t.total || 0), 0);
+
+    const creditSales = db.transactions
+      .filter((t) => t.salesman_id === sales._id && t.transaction_date.startsWith(business_date) && t.status !== "CANCELLED" && (t.payment_method === "CREDIT" || t.payment_method === "TEMPO"))
+      .reduce((sum, t) => sum + (t.total || 0), 0);
+
+    let collectedReceivables = 0;
+    (db.receivables || []).forEach((r) => {
+      (r.payments || []).forEach((p) => {
+        if (p.received_by === sales._id && p.payment_date.startsWith(business_date) && p.payment_method === "CASH") {
+          collectedReceivables += p.amount;
+        }
+      });
+    });
+
+    const totalExpectedCash = cashSales + collectedReceivables;
+
+    const actualDeposits = (db.cash_deposits || [])
+      .filter((d) => d.salesman_id === sales._id && d.business_date === business_date && d.status !== "REJECTED")
+      .reduce((sum, d) => sum + d.actual_deposit_amount, 0);
+
+    const cashVariance = actualDeposits - totalExpectedCash;
+
+    const stockBalanced = totalStockVariance === 0;
+    const cashBalanced = cashVariance === 0;
+
+    return {
+      salesman_id: sales._id,
+      salesman_name: sales.name,
+      salesman_code: (sales as any).code || sales._id,
+      business_date,
+      overall_status: stockBalanced && cashBalanced ? "BALANCED" : "VARIANCE",
+      stock_summary: {
+        total_skus: stockItems.length,
+        is_balanced: stockBalanced,
+        total_variance_units: totalStockVariance,
+        items: stockItems,
+      },
+      cash_summary: {
+        cash_sales: cashSales,
+        credit_sales: creditSales,
+        collected_receivables: collectedReceivables,
+        expected_cash_total: totalExpectedCash,
+        actual_deposited_cash: actualDeposits,
+        variance: cashVariance,
+        is_balanced: cashBalanced,
+      },
+    };
+  });
+
+  res.json({
+    business_date,
+    total_salesmen: results.length,
+    balanced_count: results.filter((r) => r.overall_status === "BALANCED").length,
+    variance_count: results.filter((r) => r.overall_status === "VARIANCE").length,
+    reconciliations: results,
+  });
+});
+
+apiRouter.post("/reconciliations/daily/approve", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const { salesman_id, business_date, notes } = req.body || {};
+  if (!salesman_id || !business_date) {
+    return res.status(400).json({ detail: "Salesman ID dan Tanggal Operasional wajib diisi." });
+  }
+
+  const recCode = `REC/${business_date.replace(/-/g, "")}/${salesman_id.replace("usr-", "").toUpperCase()}`;
+  const newRec: DailyReconciliationRecord = {
+    _id: `rec-daily-${Date.now()}`,
+    reconciliation_code: recCode,
+    salesman_id,
+    business_date,
+    stock_status: "BALANCED",
+    cash_status: "BALANCED",
+    total_stock_variance: 0,
+    total_cash_variance: 0,
+    status: "APPROVED",
+    approved_by: req.user!._id,
+    approved_at: new Date().toISOString(),
+    notes: notes || "Rekonsiliasi Harian Disetujui",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  db.daily_reconciliations.push(newRec);
+  syncSingleDoc("daily_reconciliations", newRec._id, newRec);
+  saveDatabaseToDisk();
+
+  recordAuditLog(
+    req.user!._id,
+    "APPROVE_DAILY_RECONCILIATION",
+    "daily_reconciliations",
+    newRec._id,
+    { reconciliation_code: recCode, salesman_id, business_date }
+  );
+
+  res.status(201).json({
+    message: `Rekonsiliasi harian ${recCode} berhasil disetujui.`,
+    reconciliation: newRec,
   });
 });

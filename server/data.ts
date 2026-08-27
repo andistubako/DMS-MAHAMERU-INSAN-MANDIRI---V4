@@ -417,6 +417,67 @@ export interface Target {
   updated_at: string;
 }
 
+export interface CashDeposit {
+  _id: string;
+  deposit_code: string;
+  salesman_id: string;
+  business_date: string;
+  expected_cash_amount: number;
+  actual_deposit_amount: number;
+  variance_amount: number;
+  notes?: string;
+  status: "PENDING" | "VERIFIED" | "REJECTED";
+  verified_by?: string;
+  verified_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReceivablePayment {
+  _id: string;
+  payment_code: string;
+  amount: number;
+  payment_date: string;
+  payment_method: "CASH" | "TRANSFER";
+  reference_no?: string;
+  received_by: string;
+  notes?: string;
+  created_at: string;
+}
+
+export interface Receivable {
+  _id: string;
+  invoice_id: string;
+  invoice_number: string;
+  outlet_id: string;
+  salesman_id: string;
+  due_date: string;
+  total_amount: number;
+  paid_amount: number;
+  remaining_amount: number;
+  status: "UNPAID" | "PARTIAL" | "PAID" | "OVERDUE";
+  payments: ReceivablePayment[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DailyReconciliationRecord {
+  _id: string;
+  reconciliation_code: string;
+  salesman_id: string;
+  business_date: string;
+  stock_status: "BALANCED" | "VARIANCE";
+  cash_status: "BALANCED" | "VARIANCE";
+  total_stock_variance: number;
+  total_cash_variance: number;
+  status: "DRAFT" | "PENDING_APPROVAL" | "APPROVED" | "REJECTED";
+  approved_by?: string;
+  approved_at?: string;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AuditLog {
   _id: string;
   user_id: string;
@@ -527,6 +588,9 @@ export const db = {
   stock_receivings: [] as StockReceiving[],
   sales_stock_ledgers: [] as SalesStockLedger[],
   targets: [] as Target[],
+  cash_deposits: [] as CashDeposit[],
+  receivables: [] as Receivable[],
+  daily_reconciliations: [] as DailyReconciliationRecord[],
   audit_logs: [] as AuditLog[],
   gps_events: [] as any[],
   password_resets: new Map<string, { email: string; expires: number }>(),
@@ -857,6 +921,9 @@ export function saveDatabaseToDisk(immediate = false) {
         stock_receivings: db.stock_receivings,
         sales_stock_ledgers: db.sales_stock_ledgers,
         targets: db.targets,
+        cash_deposits: db.cash_deposits,
+        receivables: db.receivables,
+        daily_reconciliations: db.daily_reconciliations,
         audit_logs: db.audit_logs,
         settings: db.settings,
       };
@@ -878,6 +945,46 @@ export function saveDatabaseToDisk(immediate = false) {
         saveDiskTimeout = null;
         writeNow();
       }, 50);
+    }
+  }
+}
+
+// Memory Idempotency & Mutex Locks for high-concurrency protection
+const processedIdempotencyKeys = new Map<string, { timestamp: number; response: any }>();
+const activeLocks = new Set<string>();
+
+export async function executeWithMutex<T>(lockKey: string, fn: () => Promise<T> | T): Promise<T> {
+  const startTime = Date.now();
+  while (activeLocks.has(lockKey)) {
+    if (Date.now() - startTime > 5000) {
+      throw new Error("Lock timeout: transaksi sedang diproses oleh antrian lain.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  activeLocks.add(lockKey);
+  try {
+    return await fn();
+  } finally {
+    activeLocks.delete(lockKey);
+  }
+}
+
+export function checkIdempotency(key: string | undefined): { isDuplicate: boolean; cachedResponse?: any } {
+  if (!key) return { isDuplicate: false };
+  const existing = processedIdempotencyKeys.get(key);
+  if (existing) {
+    return { isDuplicate: true, cachedResponse: existing.response };
+  }
+  return { isDuplicate: false };
+}
+
+export function recordIdempotency(key: string | undefined, response: any) {
+  if (!key) return;
+  processedIdempotencyKeys.set(key, { timestamp: Date.now(), response });
+  if (processedIdempotencyKeys.size > 1000) {
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [k, v] of processedIdempotencyKeys.entries()) {
+      if (v.timestamp < cutoff) processedIdempotencyKeys.delete(k);
     }
   }
 }
@@ -1199,6 +1306,18 @@ export function ensureDefaultMasterData() {
       { _id: "ch-3", code: "HORECA", name: "Hotel, Resto & Kafe", status: "ACTIVE", created_at: now },
       { _id: "ch-4", code: "WS", name: "Wholesaler (Grosir)", status: "ACTIVE", created_at: now },
     ];
+  } else {
+    const stdChannels = [
+      { _id: "ch-1", code: "GT", name: "General Trade (Toko Kelontong/Warung)", status: "ACTIVE", created_at: now },
+      { _id: "ch-2", code: "MT", name: "Modern Trade (Minimarket/Supermarket)", status: "ACTIVE", created_at: now },
+      { _id: "ch-3", code: "HORECA", name: "Hotel, Resto & Kafe", status: "ACTIVE", created_at: now },
+      { _id: "ch-4", code: "WS", name: "Wholesaler (Grosir)", status: "ACTIVE", created_at: now },
+    ];
+    for (const sc of stdChannels) {
+      if (!db.channels.some((c) => c._id === sc._id || c.code === sc.code)) {
+        db.channels.push(sc);
+      }
+    }
   }
 
   if (!db.open_call_reasons || db.open_call_reasons.length === 0) {
@@ -1264,6 +1383,9 @@ export function ensureDefaultMasterData() {
   if (!db.stock_receivings) db.stock_receivings = [];
   if (!db.sales_stock_ledgers) db.sales_stock_ledgers = [];
   if (!db.targets) db.targets = [];
+  if (!db.cash_deposits) db.cash_deposits = [];
+  if (!db.receivables) db.receivables = [];
+  if (!db.daily_reconciliations) db.daily_reconciliations = [];
   if (!db.audit_logs) db.audit_logs = [];
   if (!db.gps_events) db.gps_events = [];
 }
