@@ -5,6 +5,11 @@
 
 export const APP_TIMEZONE = "Asia/Jakarta";
 
+export function formatNumber(num) {
+  if (num === undefined || num === null || isNaN(num)) return "0";
+  return Number(num).toLocaleString("id-ID");
+}
+
 export function rupiah(amount) {
   if (amount === undefined || amount === null || isNaN(amount)) return "Rp 0";
   return new Intl.NumberFormat("id-ID", {
@@ -55,6 +60,21 @@ export function fmtDate(d) {
       day: "numeric",
       month: "short",
       year: "numeric",
+    });
+  } catch {
+    return String(d);
+  }
+}
+
+export function fmtDateShort(d) {
+  if (!d) return "-";
+  try {
+    const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
+    if (isNaN(date.getTime())) return String(d);
+    return date.toLocaleDateString("id-ID", {
+      timeZone: APP_TIMEZONE,
+      day: "numeric",
+      month: "short",
     });
   } catch {
     return String(d);

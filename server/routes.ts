@@ -313,17 +313,26 @@ export function isOutletAssignedToSales(salesId: string, outletId: string): bool
   const outlet = db.outlets.find((o) => o._id === outletId);
   if (!outlet) return false;
 
-  // Direct assignment
+  // 1. Direct assignment in sales_outlets
   const direct = db.sales_outlets.some(
     (so) => (so.sales_id === salesId || (so as any).salesman_id === salesId) && so.outlet_id === outletId && so.status === "ACTIVE"
   );
   if (direct) return true;
 
-  // Area-based ownership
+  // 2. Created by this sales rep (NOO / prospect registration)
+  if (outlet.created_by === salesId) return true;
+
+  // 3. Area-based ownership
   const areaId = getSalesAreaId(salesId);
   if (areaId && outlet.area_id && areaId === outlet.area_id) {
     return true;
   }
+
+  // 4. Included in assigned call plans
+  const inCallPlan = db.call_plans.some(
+    (cp) => cp.salesman_id === salesId && db.call_plan_items.some((cpi) => cpi.call_plan_id === cp._id && cpi.outlet_id === outletId)
+  );
+  if (inCallPlan) return true;
 
   return false;
 }
@@ -1266,6 +1275,54 @@ apiRouter.get("/masters/:entity", authMiddleware, (req, res) => {
     return true;
   });
 
+  // Enrich routes with area_name, outlet_count, and active_plans_count
+  if (req.params.entity === "routes") {
+    filtered = filtered.map((r: any) => {
+      const ar = db.areas.find((a) => a._id === r.area_id);
+      const outletCount = db.outlets.filter((o) => o.route_id === r._id && o.status === "ACTIVE").length;
+      const activePlansCount = db.call_plans.filter((p) => p.route_id === r._id).length;
+      return {
+        ...r,
+        area_name: ar?.name || "-",
+        outlet_count: outletCount,
+        active_plans_count: activePlansCount,
+      };
+    });
+  }
+
+  // Enrich districts with area_name
+  if (req.params.entity === "districts") {
+    filtered = filtered.map((d: any) => {
+      const ar = db.areas.find((a) => a._id === d.area_id);
+      return {
+        ...d,
+        area_name: ar?.name || "-",
+      };
+    });
+  }
+
+  // Enrich villages with district_name
+  if (req.params.entity === "villages") {
+    filtered = filtered.map((v: any) => {
+      const dist = db.districts.find((d) => d._id === v.district_id);
+      return {
+        ...v,
+        district_name: dist?.name || "-",
+      };
+    });
+  }
+
+  // Enrich prices with sku_name
+  if (req.params.entity === "prices") {
+    filtered = filtered.map((p: any) => {
+      const sku = db.skus.find((s) => s._id === p.sku_id);
+      return {
+        ...p,
+        sku_name: sku?.name ? `${sku.name} (${sku.code || sku.sku_code || ""})` : p.sku_id || "-",
+      };
+    });
+  }
+
   // Enrich salesmen with office_name and area_name, and ensure all db.users with role SALES are included
   if (req.params.entity === "salesmen") {
     const existingSalesUserIds = new Set(filtered.map((s: any) => s.user_id || s._id));
@@ -1432,7 +1489,55 @@ apiRouter.get("/areas", authMiddleware, (req, res) => {
   res.json({ items: db.areas, total: db.areas.length });
 });
 apiRouter.get("/routes", authMiddleware, (req, res) => {
-  res.json({ items: db.routes, total: db.routes.length });
+  const enriched = db.routes.map((r: any) => {
+    const ar = db.areas.find((a) => a._id === r.area_id);
+    const outletCount = db.outlets.filter((o) => o.route_id === r._id && o.status === "ACTIVE").length;
+    const activePlansCount = db.call_plans.filter((p) => p.route_id === r._id).length;
+    return {
+      ...r,
+      area_name: ar?.name || "-",
+      outlet_count: outletCount,
+      active_plans_count: activePlansCount,
+    };
+  });
+  res.json({ items: enriched, total: enriched.length });
+});
+
+apiRouter.get("/routes/:id/outlets", authMiddleware, (req: AuthenticatedRequest, res) => {
+  const route = db.routes.find((r) => r._id === req.params.id);
+  if (!route) return res.status(404).json({ detail: "Rute kunjungan tidak ditemukan." });
+
+  const area = db.areas.find((a) => a._id === route.area_id);
+  const salesmanId = req.query.salesman_id as string;
+  const assignedIds = salesmanId ? new Set(getActiveAssignedOutletIds(salesmanId)) : null;
+
+  const outlets = db.outlets
+    .filter((o) => o.route_id === route._id && o.status === "ACTIVE" && (!assignedIds || assignedIds.has(o._id)))
+    .map((o) => {
+      const channel = db.channels.find((c) => c._id === o.channel_id);
+      const lastVisit = db.visits
+        .filter((v) => v.outlet_id === o._id)
+        .sort((a, b) => (b.check_in_time || b.date).localeCompare(a.check_in_time || a.date))[0];
+
+      return {
+        ...o,
+        channel_name: channel?.name || "-",
+        area_name: area?.name || "-",
+        route_name: route.name,
+        last_visited: lastVisit?.date || "Belum pernah",
+        last_call_result: lastVisit?.call_result || "-",
+      };
+    });
+
+  res.json({
+    route: {
+      ...route,
+      area_name: area?.name || "-",
+      outlet_count: outlets.length,
+    },
+    items: outlets,
+    total: outlets.length,
+  });
 });
 apiRouter.get("/prices", authMiddleware, (req, res) => {
   res.json({ items: db.prices, total: db.prices.length });
@@ -4935,74 +5040,183 @@ apiRouter.post("/gps/events", authMiddleware, (req: AuthenticatedRequest, res) =
 
 // ================= CALL PLANS =================
 apiRouter.get("/call-plans/my", authMiddleware, (req: AuthenticatedRequest, res) => {
-  const date = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+  const date = (req.query.date as string) || getTodayWIB();
   const cp = db.call_plans.find((p) => p.salesman_id === req.user!._id && p.date === date);
 
   if (!cp) {
-    return res.json({ call_plan: null, items: [], summary: { planned: 0, visited: 0, pending: 0 } });
+    return res.json({
+      plan: null,
+      call_plan: null,
+      items: [],
+      summary: { planned: 0, visited: 0, completed: 0, effective: 0, open: 0, pending: 0, missed: 0 },
+    });
   }
+
+  const creator = db.users.find((u) => u._id === cp.created_by);
+  const route = cp.route_id ? db.routes.find((r) => r._id === cp.route_id) : null;
+  const planEnriched = {
+    ...cp,
+    created_by_name: creator?.name || "Supervisor",
+    route_id: cp.route_id || null,
+    route_name: route?.name || "-",
+    route_code: route?.code || null,
+  };
+
+  const visitsToday = db.visits.filter((v) => v.salesman_id === req.user!._id && v.date === date);
 
   const items = db.call_plan_items
     .filter((i) => i.call_plan_id === cp._id)
     .sort((a, b) => a.sequence - b.sequence)
     .map((i) => {
       const outlet = db.outlets.find((o) => o._id === i.outlet_id);
+      const channel = outlet?.channel_id ? db.channels.find((c) => c._id === outlet.channel_id) : null;
+      const area = outlet?.area_id ? db.areas.find((a) => a._id === outlet.area_id) : null;
+      const outletRoute = outlet?.route_id ? db.routes.find((r) => r._id === outlet.route_id) : null;
+      
+      const v = visitsToday.find((vis) => vis.outlet_id === i.outlet_id);
+      let itemStatus: string = i.status || "PENDING";
+      let visitInfo: any = null;
+
+      if (v) {
+        if (v.status === "IN_PROGRESS") {
+          itemStatus = "IN_PROGRESS";
+        } else if (v.call_result === "EFFECTIVE") {
+          itemStatus = "EFFECTIVE";
+        } else if (v.status === "COMPLETED") {
+          itemStatus = "COMPLETED";
+        } else {
+          itemStatus = "VISITED";
+        }
+
+        visitInfo = {
+          visit_id: v._id,
+          check_in_time: v.check_in_time,
+          check_out_time: v.check_out_time,
+          duration_seconds: v.duration_seconds,
+          call_result: v.call_result,
+          total_sales: v.total_sales || 0,
+          status: v.status,
+          notes: v.notes,
+        };
+      }
+
       return {
         ...i,
-        outlet,
+        status: itemStatus,
+        priority: (i as any).priority || "NORMAL",
+        notes: (i as any).notes || "",
+        visit: visitInfo,
+        outlet: outlet
+          ? {
+              ...outlet,
+              channel_name: channel?.name || "-",
+              area_name: area?.name || "-",
+              route_id: outlet.route_id || null,
+              route_name: outletRoute?.name || "-",
+            }
+          : null,
       };
     });
 
-  const visited = items.filter((i) => i.status === "VISITED").length;
-  const pending = items.length - visited;
+  const effectiveCount = items.filter((i: any) => i.status === "EFFECTIVE").length;
+  const completedCount = items.filter((i: any) => ["COMPLETED", "EFFECTIVE", "VISITED"].includes(i.status)).length;
+  const openCount = items.filter((i: any) => i.status === "COMPLETED" || (i.visit && i.visit.call_result === "OPEN")).length;
+  const pendingCount = items.filter((i: any) => i.status === "PENDING" || i.status === "IN_PROGRESS").length;
+
+  const summary = {
+    planned: items.length,
+    visited: completedCount,
+    completed: completedCount,
+    effective: effectiveCount,
+    open: openCount,
+    pending: pendingCount,
+    missed: Math.max(0, items.length - completedCount),
+  };
 
   res.json({
-    call_plan: cp,
+    plan: planEnriched,
+    call_plan: planEnriched,
     items,
-    summary: {
-      planned: items.length,
-      visited,
-      pending,
-    },
+    summary,
   });
 });
 
 apiRouter.get("/call-plans", authMiddleware, (req: AuthenticatedRequest, res) => {
-  const date = req.query.date as string;
-  const filterSalesmanId = req.query.salesman_id as string;
+  const { date, from_date, to_date, salesman_id: filterSalesmanId, status, route_id } = req.query as Record<string, string>;
   const salesman_id = req.user!.role === "SALES" ? req.user!._id : filterSalesmanId;
 
   let plans = db.call_plans.filter((p) => {
     if (date && p.date !== date) return false;
+    if (from_date && p.date < from_date) return false;
+    if (to_date && p.date > to_date) return false;
     if (salesman_id && p.salesman_id !== salesman_id) return false;
+    if (status && p.status !== status) return false;
+    if (route_id && p.route_id !== route_id) return false;
     return true;
   });
 
+  plans.sort((a, b) => (b.date + b._id).localeCompare(a.date + a._id));
+
   const enriched = plans.map((p) => {
     const salesman = db.users.find((u) => u._id === p.salesman_id);
-    const count = db.call_plan_items.filter((i) => i.call_plan_id === p._id).length;
+    const creator = db.users.find((u) => u._id === p.created_by);
+    const area = salesman?.area_id ? db.areas.find((a) => a._id === salesman.area_id) : null;
+    const route = p.route_id ? db.routes.find((r) => r._id === p.route_id) : null;
+    const planItems = db.call_plan_items.filter((i) => i.call_plan_id === p._id);
+    
+    // Visit progress for that plan
+    const visits = db.visits.filter((v) => v.salesman_id === p.salesman_id && v.date === p.date);
+    const visitedOutletIds = new Set(visits.map((v) => v.outlet_id));
+    const effectiveOutletIds = new Set(visits.filter((v) => v.call_result === "EFFECTIVE").map((v) => v.outlet_id));
+    
+    const visitedCount = planItems.filter((i) => visitedOutletIds.has(i.outlet_id)).length;
+    const effectiveCount = planItems.filter((i) => effectiveOutletIds.has(i.outlet_id)).length;
+    const totalSales = visits.reduce((sum, v) => sum + (v.total_sales || 0), 0);
+
     return {
       ...p,
       salesman_name: salesman?.name || "-",
-      item_count: count,
+      salesman_code: (salesman as any)?.code || p.salesman_id,
+      salesman_phone: (salesman as any)?.phone || "-",
+      area_name: area?.name || "-",
+      route_id: p.route_id || null,
+      route_name: route?.name || "-",
+      route_code: route?.code || null,
+      created_by_name: creator?.name || "Supervisor",
+      item_count: planItems.length,
+      total_outlets: planItems.length,
+      visited_count: visitedCount,
+      completed_count: visitedCount,
+      effective_count: effectiveCount,
+      total_sales: totalSales,
+      progress_percent: planItems.length > 0 ? Math.round((visitedCount / planItems.length) * 100) : 0,
     };
   });
 
   res.json({ items: enriched, total: enriched.length });
 });
 
-apiRouter.post("/call-plans", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER"), (req: AuthenticatedRequest, res) => {
-  const { salesman_id, date, outlet_ids } = req.body || {};
-  if (!salesman_id || !date || !outlet_ids || !outlet_ids.length) {
-    return res.status(400).json({ detail: "Salesman, tanggal, dan daftar outlet wajib diisi." });
+apiRouter.post("/call-plans", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER", "SALES"), (req: AuthenticatedRequest, res) => {
+  const { salesman_id, date, outlet_ids, items, notes, status = "PUBLISHED", route_id } = req.body || {};
+  const targetSalesId = req.user!.role === "SALES" ? req.user!._id : (salesman_id || req.user!._id);
+  const targetDate = date || getTodayWIB();
+
+  const rawItemList: Array<{ outlet_id: string; sequence?: number; priority?: string; notes?: string }> = Array.isArray(items) && items.length > 0
+    ? items
+    : Array.isArray(outlet_ids) && outlet_ids.length > 0
+    ? outlet_ids.map((id: string, idx: number) => ({ outlet_id: id, sequence: idx + 1, priority: "NORMAL" }))
+    : [];
+
+  if (!targetSalesId || !targetDate || rawItemList.length === 0) {
+    return res.status(400).json({ detail: "Salesman, tanggal, dan minimal 1 outlet wajib diisi." });
   }
 
   // Validate that all outlets in the plan are actively assigned to this salesman
   const unassignedOutlets: string[] = [];
-  for (const outId of outlet_ids) {
-    if (!isOutletAssignedToSales(salesman_id, outId)) {
-      const o = db.outlets.find((item) => item._id === outId);
-      unassignedOutlets.push(o ? `${o.outlet_name} (${o.outlet_code})` : outId);
+  for (const it of rawItemList) {
+    if (!isOutletAssignedToSales(targetSalesId, it.outlet_id)) {
+      const o = db.outlets.find((item) => item._id === it.outlet_id);
+      unassignedOutlets.push(o ? `${o.outlet_name} (${o.outlet_code})` : it.outlet_id);
     }
   }
 
@@ -5013,81 +5227,478 @@ apiRouter.post("/call-plans", authMiddleware, requireRoles("ADMIN", "SUPERVISOR"
     });
   }
 
-  const planId = `cp-${Date.now()}`;
-  const newPlan: CallPlan = {
-    _id: planId,
-    plan_code: `CP-${date.replace(/-/g, "")}-${String(db.call_plans.length + 1).padStart(3, "0")}`,
-    salesman_id,
-    date,
-    status: "PUBLISHED",
-    total_outlets: outlet_ids.length,
-    created_at: new Date().toISOString(),
-    created_by: req.user!._id,
-  };
+  // Check if a call plan already exists for this salesman on this date
+  let existingPlan = db.call_plans.find((p) => p.salesman_id === targetSalesId && p.date === targetDate);
+  let planId: string;
 
-  db.call_plans.push(newPlan);
-  syncSingleDoc("call_plans", newPlan._id, newPlan);
+  if (existingPlan) {
+    planId = existingPlan._id;
+    existingPlan.status = status;
+    existingPlan.total_outlets = rawItemList.length;
+    if (route_id !== undefined) existingPlan.route_id = route_id || null;
+    (existingPlan as any).notes = notes || (existingPlan as any).notes || "";
+    (existingPlan as any).updated_at = new Date().toISOString();
+    (existingPlan as any).updated_by = req.user!._id;
 
-  outlet_ids.forEach((outId: string, idx: number) => {
-    db.call_plan_items.push({
+    // Clean up old items and replace
+    db.call_plan_items = db.call_plan_items.filter((i) => i.call_plan_id !== planId);
+    syncSingleDoc("call_plans", existingPlan._id, existingPlan);
+  } else {
+    planId = `cp-${Date.now()}`;
+    const newPlan: CallPlan = {
+      _id: planId,
+      plan_code: `CP-${targetDate.replace(/-/g, "")}-${String(db.call_plans.length + 1).padStart(3, "0")}`,
+      salesman_id: targetSalesId,
+      date: targetDate,
+      route_id: route_id || null,
+      status,
+      total_outlets: rawItemList.length,
+      created_at: new Date().toISOString(),
+      created_by: req.user!._id,
+      notes: notes || "",
+    } as any;
+
+    db.call_plans.push(newPlan);
+    syncSingleDoc("call_plans", newPlan._id, newPlan);
+    existingPlan = newPlan;
+  }
+
+  // Add items with sequence & priority
+  rawItemList.forEach((it, idx) => {
+    const newItem = {
       _id: `cpi-${Date.now()}-${idx}`,
       call_plan_id: planId,
-      outlet_id: outId,
-      sequence: idx + 1,
+      outlet_id: it.outlet_id,
+      sequence: Number(it.sequence) || (idx + 1),
+      priority: it.priority || "NORMAL",
       status: "PENDING",
+      notes: it.notes || "",
       created_at: new Date().toISOString(),
-    });
+    };
+    db.call_plan_items.push(newItem as any);
   });
 
   recordAuditLog(
     req.user!._id,
-    "CREATE_CALL_PLAN",
+    existingPlan ? "UPDATE_CALL_PLAN" : "CREATE_CALL_PLAN",
     "call_plans",
-    newPlan._id,
-    { salesman_id, date, count: outlet_ids.length }
+    planId,
+    { salesman_id: targetSalesId, date: targetDate, route_id, count: rawItemList.length }
   );
 
-  res.status(201).json(newPlan);
+  res.status(201).json(existingPlan);
+});
+
+apiRouter.put("/call-plans/:id", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER", "SALES"), (req: AuthenticatedRequest, res) => {
+  const plan = db.call_plans.find((p) => p._id === req.params.id);
+  if (!plan) return res.status(404).json({ detail: "Call plan tidak ditemukan." });
+
+  if (req.user!.role === "SALES" && plan.salesman_id !== req.user!._id) {
+    return res.status(403).json({ detail: "Akses ditolak. Call plan milik sales lain." });
+  }
+
+  const { salesman_id, date, outlet_ids, items, status, notes, route_id } = req.body || {};
+
+  const targetSalesId = req.user!.role === "SALES" ? plan.salesman_id : (salesman_id || plan.salesman_id);
+  const targetDate = date || plan.date;
+
+  const rawItemList: Array<{ outlet_id: string; sequence?: number; priority?: string; notes?: string }> = Array.isArray(items) && items.length > 0
+    ? items
+    : Array.isArray(outlet_ids) && outlet_ids.length > 0
+    ? outlet_ids.map((id: string, idx: number) => ({ outlet_id: id, sequence: idx + 1, priority: "NORMAL" }))
+    : [];
+
+  if (rawItemList.length === 0) {
+    return res.status(400).json({ detail: "Daftar outlet minimal 1 toko." });
+  }
+
+  // Validate unassigned outlets
+  const unassignedOutlets: string[] = [];
+  for (const it of rawItemList) {
+    if (!isOutletAssignedToSales(targetSalesId, it.outlet_id)) {
+      const o = db.outlets.find((item) => item._id === it.outlet_id);
+      unassignedOutlets.push(o ? `${o.outlet_name} (${o.outlet_code})` : it.outlet_id);
+    }
+  }
+
+  if (unassignedOutlets.length > 0) {
+    return res.status(400).json({
+      detail: `Terdapat outlet yang belum ditugaskan kepada salesman ini: ${unassignedOutlets.join(", ")}.`,
+      code: "OUTLET_NOT_ASSIGNED_TO_SALESMAN",
+    });
+  }
+
+  // Update plan meta
+  plan.salesman_id = targetSalesId;
+  plan.date = targetDate;
+  if (status) plan.status = status;
+  if (route_id !== undefined) plan.route_id = route_id || null;
+  if (notes !== undefined) (plan as any).notes = notes;
+  plan.total_outlets = rawItemList.length;
+  (plan as any).updated_at = new Date().toISOString();
+  (plan as any).updated_by = req.user!._id;
+
+  // Preserve existing visit status if already visited
+  const oldItems = db.call_plan_items.filter((i) => i.call_plan_id === plan._id);
+  const oldStatusMap = new Map(oldItems.map((i) => [i.outlet_id, i.status]));
+
+  // Replace items
+  db.call_plan_items = db.call_plan_items.filter((i) => i.call_plan_id !== plan._id);
+
+  rawItemList.forEach((it, idx) => {
+    const prevStatus = oldStatusMap.get(it.outlet_id) || "PENDING";
+    const newItem = {
+      _id: `cpi-${Date.now()}-${idx}`,
+      call_plan_id: plan._id,
+      outlet_id: it.outlet_id,
+      sequence: Number(it.sequence) || (idx + 1),
+      priority: it.priority || "NORMAL",
+      status: prevStatus,
+      notes: it.notes || "",
+      created_at: new Date().toISOString(),
+    };
+    db.call_plan_items.push(newItem as any);
+  });
+
+  recordAuditLog(
+    req.user!._id,
+    "UPDATE_CALL_PLAN",
+    "call_plans",
+    plan._id,
+    { salesman_id: targetSalesId, date: targetDate, route_id, count: rawItemList.length }
+  );
+
+  syncSingleDoc("call_plans", plan._id, plan);
+
+  res.json({
+    message: "Call plan berhasil diperbarui.",
+    plan,
+  });
+});
+
+// Route Optimizer / Nearest Neighbor Heuristic endpoint
+apiRouter.post("/call-plans/:id/optimize", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER", "SALES"), (req: AuthenticatedRequest, res) => {
+  const plan = db.call_plans.find((p) => p._id === req.params.id);
+  if (!plan) return res.status(404).json({ detail: "Call plan tidak ditemukan." });
+
+  const items = db.call_plan_items.filter((i) => i.call_plan_id === plan._id);
+  if (items.length <= 1) {
+    return res.json({ message: "Rute sudah optimal.", plan, items });
+  }
+
+  // Determine starting point: salesman office or current live location
+  const salesUser = db.users.find((u) => u._id === plan.salesman_id);
+  const office = salesUser?.office_id ? db.offices.find((o) => o._id === salesUser.office_id) : db.offices[0];
+  
+  let currentLat = office?.latitude ?? -6.2088;
+  let currentLng = office?.longitude ?? 106.8456;
+
+  if (salesUser?.last_location?.latitude && salesUser?.last_location?.longitude) {
+    currentLat = salesUser.last_location.latitude;
+    currentLng = salesUser.last_location.longitude;
+  }
+
+  // Nearest neighbor route sequencing
+  const unvisited = [...items];
+  const optimized: typeof items = [];
+
+  while (unvisited.length > 0) {
+    let nearestIdx = 0;
+    let minDistance = Infinity;
+
+    for (let i = 0; i < unvisited.length; i++) {
+      const outlet = db.outlets.find((o) => o._id === unvisited[i].outlet_id);
+      const lat = Number(outlet?.latitude ?? 0);
+      const lng = Number(outlet?.longitude ?? 0);
+
+      if (lat !== 0 && lng !== 0) {
+        const dist = haversineMeters(currentLat, currentLng, lat, lng);
+        if (dist < minDistance) {
+          minDistance = dist;
+          nearestIdx = i;
+        }
+      }
+    }
+
+    const nextItem = unvisited.splice(nearestIdx, 1)[0];
+    optimized.push(nextItem);
+
+    const nextOutlet = db.outlets.find((o) => o._id === nextItem.outlet_id);
+    if (nextOutlet?.latitude && nextOutlet?.longitude) {
+      currentLat = Number(nextOutlet.latitude);
+      currentLng = Number(nextOutlet.longitude);
+    }
+  }
+
+  // Re-assign sequence
+  optimized.forEach((item, idx) => {
+    item.sequence = idx + 1;
+  });
+
+  recordAuditLog(
+    req.user!._id,
+    "OPTIMIZE_CALL_PLAN_ROUTE",
+    "call_plans",
+    plan._id,
+    { count: items.length }
+  );
+
+  res.json({
+    message: "Urutan rute berhasil dioptimalkan berdasarkan jarak geografis terdekat.",
+    items: optimized.map((it) => ({
+      ...it,
+      outlet: db.outlets.find((o) => o._id === it.outlet_id),
+    })),
+  });
+});
+
+// Auto-generate Smart Call Plan based on Cycle, Route & NOO
+apiRouter.post("/call-plans/auto-generate", authMiddleware, requireRoles("ADMIN", "SUPERVISOR", "OWNER"), (req: AuthenticatedRequest, res) => {
+  const { salesman_id, date, max_outlets = 10, channel_id, area_id, route_id } = req.body || {};
+  const targetDate = date || getTodayWIB();
+
+  if (!salesman_id) {
+    return res.status(400).json({ detail: "Salesman wajib dipilih." });
+  }
+
+  const assignedOutletIds = getActiveAssignedOutletIds(salesman_id);
+  if (assignedOutletIds.length === 0) {
+    return res.status(400).json({ detail: "Salesman ini belum memiliki outlet yang ditugaskan." });
+  }
+
+  let candidates = db.outlets.filter((o) => o.status === "ACTIVE" && assignedOutletIds.includes(o._id));
+  if (route_id) candidates = candidates.filter((o) => o.route_id === route_id);
+  if (channel_id) candidates = candidates.filter((o) => o.channel_id === channel_id);
+  if (area_id) candidates = candidates.filter((o) => o.area_id === area_id);
+
+  if (candidates.length === 0) {
+    return res.status(400).json({ detail: "Tidak ditemukan outlet aktif yang sesuai kriteria rute atau filter yang dipilih." });
+  }
+
+  // Score candidate outlets
+  const scored = candidates.map((o) => {
+    const lastVisit = db.visits
+      .filter((v) => v.outlet_id === o._id)
+      .sort((a, b) => (b.check_in_time || b.date).localeCompare(a.check_in_time || a.date))[0];
+
+    const lastTxn = db.transactions
+      .filter((t) => t.outlet_id === o._id && t.status !== "CANCELLED")
+      .sort((a, b) => b.transaction_date.localeCompare(a.transaction_date))[0];
+
+    let daysNoVisit = 999;
+    if (lastVisit?.date) {
+      const diff = Date.now() - new Date(lastVisit.date).getTime();
+      daysNoVisit = Math.max(0, Math.floor(diff / 86400000));
+    }
+
+    let daysNoOrder = 999;
+    if (lastTxn?.transaction_date) {
+      const diff = Date.now() - new Date(lastTxn.transaction_date).getTime();
+      daysNoOrder = Math.max(0, Math.floor(diff / 86400000));
+    }
+
+    let score = 0;
+    let priority = "NORMAL";
+    let reason = "Kunjungan siklus rutin";
+
+    if (o.lifecycle_status === "NOO" || o.lifecycle_status === "PROSPECT") {
+      score += 150;
+      priority = "HIGH";
+      reason = "Outlet Baru (NOO / Prospect) perlu kunjungan perdana";
+    } else if (daysNoVisit > 14) {
+      score += 120;
+      priority = "HIGH";
+      reason = `Belum dikunjungi ${daysNoVisit} hari`;
+    } else if (daysNoOrder > 21) {
+      score += 90;
+      priority = "HIGH";
+      reason = `Tidak ada transaksi selama ${daysNoOrder} hari`;
+    } else if (daysNoVisit > 7) {
+      score += 60;
+      priority = "MEDIUM";
+      reason = `Siklus mingguan (${daysNoVisit} hari lalu)`;
+    } else {
+      score += 20;
+    }
+
+    // Boost if matches selected route
+    if (route_id && o.route_id === route_id) {
+      score += 50;
+    }
+
+    // Boost high revenue outlets
+    if ((o.total_revenue || 0) > 5000000) {
+      score += 30;
+    }
+
+    const routeObj = o.route_id ? db.routes.find((r) => r._id === o.route_id) : null;
+
+    return {
+      outlet_id: o._id,
+      outlet_name: o.outlet_name,
+      address: o.address,
+      route_id: o.route_id || null,
+      route_name: routeObj?.name || "-",
+      latitude: o.latitude,
+      longitude: o.longitude,
+      score,
+      priority,
+      reason,
+      days_no_visit: daysNoVisit === 999 ? null : daysNoVisit,
+      days_no_order: daysNoOrder === 999 ? null : daysNoOrder,
+    };
+  });
+
+  // Sort by highest score and take top limit
+  scored.sort((a, b) => b.score - a.score);
+  const selected = scored.slice(0, Number(max_outlets) || 10);
+  const selectedRoute = route_id ? db.routes.find((r) => r._id === route_id) : null;
+
+  // Return preview of recommended call plan items
+  res.json({
+    date: targetDate,
+    salesman_id,
+    route_id: route_id || null,
+    route_name: selectedRoute?.name || null,
+    total_recommended: selected.length,
+    items: selected.map((it, idx) => ({
+      outlet_id: it.outlet_id,
+      outlet_name: it.outlet_name,
+      address: it.address,
+      route_id: it.route_id,
+      route_name: it.route_name,
+      sequence: idx + 1,
+      priority: it.priority,
+      reason: it.reason,
+      days_no_visit: it.days_no_visit,
+      days_no_order: it.days_no_order,
+    })),
+  });
 });
 
 apiRouter.get("/call-plans/smart/recommendations", authMiddleware, (req: AuthenticatedRequest, res) => {
   const salesman_id = (req.query.salesman_id as string) || (req.user!.role === "SALES" ? req.user!._id : "");
+  const route_id = req.query.route_id as string;
 
   // If salesman is known or user is sales, filter candidate outlets strictly to assigned outlets
   const assignedIds = salesman_id ? new Set(getActiveAssignedOutletIds(salesman_id)) : null;
 
   const recommendations = db.outlets
-    .filter((o) => o.status === "ACTIVE" && (!assignedIds || assignedIds.has(o._id)))
+    .filter((o) => o.status === "ACTIVE" && (!assignedIds || assignedIds.has(o._id)) && (!route_id || o.route_id === route_id))
     .map((o) => {
       const lastVisit = db.visits
         .filter((v) => v.outlet_id === o._id)
-        .sort((a, b) => b.check_in_time.localeCompare(a.check_in_time))[0];
+        .sort((a, b) => (b.check_in_time || b.date).localeCompare(a.check_in_time || a.date))[0];
+
+      const lastTxn = db.transactions
+        .filter((t) => t.outlet_id === o._id && t.status !== "CANCELLED")
+        .sort((a, b) => b.transaction_date.localeCompare(a.transaction_date))[0];
+
+      const routeObj = o.route_id ? db.routes.find((r) => r._id === o.route_id) : null;
+
+      let daysNoVisit = null;
+      if (lastVisit?.date) {
+        const diff = Date.now() - new Date(lastVisit.date).getTime();
+        daysNoVisit = Math.max(0, Math.floor(diff / 86400000));
+      }
+
+      let daysNoOrder = null;
+      if (lastTxn?.transaction_date) {
+        const diff = Date.now() - new Date(lastTxn.transaction_date).getTime();
+        daysNoOrder = Math.max(0, Math.floor(diff / 86400000));
+      }
+
+      let priority = "NORMAL";
+      let reason = "Kunjungan siklus rutin";
+
+      if (o.lifecycle_status === "NOO" || o.lifecycle_status === "PROSPECT") {
+        priority = "HIGH";
+        reason = "Outlet baru (NOO) belum pernah dikunjungi";
+      } else if (daysNoVisit == null || daysNoVisit > 14) {
+        priority = "HIGH";
+        reason = daysNoVisit == null ? "Belum pernah dikunjungi" : `Sudah ${daysNoVisit} hari tidak dikunjungi`;
+      } else if (daysNoOrder != null && daysNoOrder > 21) {
+        priority = "HIGH";
+        reason = `${daysNoOrder} hari tidak ada order`;
+      } else if (daysNoVisit > 7) {
+        priority = "MEDIUM";
+        reason = `Siklus mingguan (${daysNoVisit} hari)`;
+      }
+
       return {
         ...o,
+        outlet_id: o._id,
         channel_name: db.channels.find((c) => c._id === o.channel_id)?.name || "-",
+        area_name: db.areas.find((a) => a._id === o.area_id)?.name || "-",
+        route_id: o.route_id || null,
+        route_name: routeObj?.name || "-",
         last_visited: lastVisit?.date || "Belum pernah",
-        recommendation_reason: !lastVisit
-          ? "Outlet baru belum pernah dikunjungi"
-          : "Jadwal siklus kunjungan rutin",
+        days_no_visit: daysNoVisit,
+        days_no_order: daysNoOrder,
+        priority,
+        recommendation_reason: reason,
       };
     });
 
-  res.json(recommendations);
+  // Sort: HIGH priority first, then by days no visit
+  recommendations.sort((a, b) => {
+    const pRank: Record<string, number> = { HIGH: 3, MEDIUM: 2, NORMAL: 1 };
+    const diff = (pRank[b.priority] || 0) - (pRank[a.priority] || 0);
+    if (diff !== 0) return diff;
+    return (b.days_no_visit ?? 999) - (a.days_no_visit ?? 999);
+  });
+
+  res.json({ items: recommendations, total: recommendations.length });
 });
 
 apiRouter.get("/call-plans/:id", authMiddleware, (req, res) => {
   const plan = db.call_plans.find((p) => p._id === req.params.id);
   if (!plan) return res.status(404).json({ detail: "Call plan tidak ditemukan." });
 
+  const salesman = db.users.find((u) => u._id === plan.salesman_id);
+  const creator = db.users.find((u) => u._id === plan.created_by);
+  const area = salesman?.area_id ? db.areas.find((a) => a._id === salesman.area_id) : null;
+  const route = plan.route_id ? db.routes.find((r) => r._id === plan.route_id) : null;
+  const visits = db.visits.filter((v) => v.salesman_id === plan.salesman_id && v.date === plan.date);
+
   const items = db.call_plan_items
     .filter((i) => i.call_plan_id === plan._id)
-    .map((i) => ({
-      ...i,
-      outlet: db.outlets.find((o) => o._id === i.outlet_id),
-    }));
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((i) => {
+      const outlet = db.outlets.find((o) => o._id === i.outlet_id);
+      const outletRoute = outlet?.route_id ? db.routes.find((r) => r._id === outlet.route_id) : null;
+      const v = visits.find((vis) => vis.outlet_id === i.outlet_id);
+      return {
+        ...i,
+        outlet: outlet ? {
+          ...outlet,
+          route_id: outlet.route_id || null,
+          route_name: outletRoute?.name || "-",
+        } : null,
+        visit: v
+          ? {
+              visit_id: v._id,
+              status: v.status,
+              call_result: v.call_result,
+              check_in_time: v.check_in_time,
+              check_out_time: v.check_out_time,
+              duration_seconds: v.duration_seconds,
+              total_sales: v.total_sales || 0,
+            }
+          : null,
+      };
+    });
 
   res.json({
     ...plan,
+    salesman_name: salesman?.name || "-",
+    salesman_code: (salesman as any)?.code || plan.salesman_id,
+    salesman_phone: (salesman as any)?.phone || "-",
+    area_name: area?.name || "-",
+    route_id: plan.route_id || null,
+    route_name: route?.name || "-",
+    route_code: route?.code || null,
+    created_by_name: creator?.name || "Supervisor",
     items,
   });
 });
@@ -5375,65 +5986,198 @@ apiRouter.post("/sales/location", authMiddleware, (req: AuthenticatedRequest, re
 });
 
 apiRouter.get("/monitoring/sales", authMiddleware, requireRoles("SUPERVISOR", "ADMIN", "OWNER"), (req, res) => {
-  const today = getTodayWIB();
-  const currentPeriod = getCurrentPeriodWIB();
-  const salesUsers = db.users.filter((u) => u.role === "SALES");
+  const { date, salesman_id, area_id, office_id, status: filterStatus } = req.query as Record<string, string>;
+  const queryDate = date || getTodayWIB();
+  const currentPeriod = queryDate.slice(0, 7) || getCurrentPeriodWIB();
+
+  // 1. Resolve all active Sales personnel
+  let salesUsers = db.users.filter(
+    (u) => (u.role === "SALES" || (u.role as string) === "SALESMAN") && (u.status as string) !== "ARCHIVED"
+  );
+
+  if (salesman_id) {
+    salesUsers = salesUsers.filter((u) => u._id === salesman_id);
+  }
+  if (area_id) {
+    salesUsers = salesUsers.filter((u) => u.area_id === area_id);
+  }
+  if (office_id) {
+    salesUsers = salesUsers.filter((u) => u.office_id === office_id);
+  }
 
   const salesmenStatus = salesUsers.map((u) => {
-    const att = db.attendance.find((a) => a.salesman_id === u._id && a.date === today);
-    const cp = db.call_plans.find((p) => p.salesman_id === u._id && p.date === today);
-    const planned = cp ? db.call_plan_items.filter((i) => i.call_plan_id === cp._id).length : 0;
+    const att = db.attendance.find((a) => a.salesman_id === u._id && a.date === queryDate);
+    const cp = db.call_plans.find((p) => p.salesman_id === u._id && p.date === queryDate);
+    
+    // Call plan items
+    const rawCpItems = cp ? db.call_plan_items.filter((i) => i.call_plan_id === cp._id).sort((a, b) => a.sequence - b.sequence) : [];
+    const planned = rawCpItems.length;
 
-    const kpi = calculateSalesKPIs({ salesmanId: u._id, from: today, to: today });
-    const tgt = calculateVolumeTargetAndAchievement({ salesmanId: u._id, period: currentPeriod });
+    const kpi = calculateSalesKPIs({ salesmanId: u._id, from: queryDate, to: queryDate });
+    const tgt = calculateVolumeTargetAndAchievement({ salesmanId: u._id, period: currentPeriod, from: `${currentPeriod}-01`, to: `${currentPeriod}-31` });
 
     const missed = Math.max(0, planned - kpi.outlet_calls);
-    const newOutlets = db.outlets.filter((o) => o.created_by === u._id && o.created_at?.startsWith(today)).length;
+    const newOutlets = db.outlets.filter((o) => o.created_by === u._id && (o.created_at || "").startsWith(queryDate)).length;
     const active = db.visits.find((v) => v.salesman_id === u._id && v.status === "IN_PROGRESS");
-    const status = active ? "VISITING" : (att ? (att.status === "PRESENT" ? "ON_FIELD" : "ON_DUTY") : "OFF_DUTY");
-    const areaName = db.areas.find((a) => a._id === u.area_id)?.name || "-";
-    const officeName = db.offices.find((o) => o._id === u.office_id)?.office_name || "-";
-
-    // Get today's visits trail for this salesman
+    
+    // Today's visits trail for this salesman
     const todayVisits = db.visits
-      .filter((v) => v.salesman_id === u._id && v.date === today)
+      .filter((v) => v.salesman_id === u._id && v.date === queryDate)
       .map((v) => {
         const outlet = db.outlets.find((o) => o._id === v.outlet_id);
         const txns = db.transactions.filter((t) => t.visit_id === v._id);
-        const visitRev = txns.reduce((sum, t) => sum + (t.total ?? t.total_amount ?? 0), 0);
-        const visitVol = txns.reduce((sum, t) => sum + ((t.items || []).reduce((is, it) => is + (Number(it.quantity || it.volume || 0)), 0)), 0);
+        const visitRev = txns.reduce((sum, t) => sum + (t.total ?? (t as any).total_amount ?? 0), 0);
+        const visitVol = txns.reduce(
+          (sum, t) => sum + ((t.items || []).reduce((is, it) => is + (Number(it.quantity || (it as any).volume || 0)), 0)),
+          0
+        );
+        const durSec = v.duration_seconds || (v.check_out_time ? Math.round((new Date(v.check_out_time).getTime() - new Date(v.check_in_time).getTime()) / 1000) : 0);
         return {
           ...v,
           outlet_name: outlet?.outlet_name || "Outlet",
           outlet_code: outlet?.outlet_code || "-",
           address: outlet?.address || "-",
+          phone: outlet?.phone || "-",
+          owner_name: outlet?.owner_name || "-",
+          channel_name: outlet?.channel_id || "Retail",
           call_result: v.call_result || (txns.length > 0 ? "EFFECTIVE" : "OPEN"),
           revenue: visitRev,
           volume: visitVol,
           transaction_count: txns.length,
+          duration_seconds: durSec,
+          duration_minutes: Math.round(durSec / 60),
+          formatted_time: formatDateTimeWIB(v.check_in_time),
         };
       })
       .sort((a, b) => new Date(a.check_in_time).getTime() - new Date(b.check_in_time).getTime());
 
-    // Resolve most accurate current location
+    // Enrich Call Plan items with visit outcome
+    const enrichedCpItems = rawCpItems.map((cpi) => {
+      const outlet = db.outlets.find((o) => o._id === cpi.outlet_id);
+      const visit = todayVisits.find((v) => v.outlet_id === cpi.outlet_id);
+      return {
+        ...cpi,
+        outlet_name: outlet?.outlet_name || "-",
+        outlet_code: outlet?.outlet_code || "-",
+        address: outlet?.address || "-",
+        phone: outlet?.phone || "-",
+        status: visit ? "VISITED" : cpi.status,
+        call_result: visit?.call_result || null,
+        visited_at: visit?.check_in_time || null,
+        revenue: visit?.revenue || 0,
+        volume: visit?.volume || 0,
+      };
+    });
+
+    const visitedCpCount = enrichedCpItems.filter((i) => i.status === "VISITED").length;
+    const planCompliancePct = planned > 0 ? Math.round((visitedCpCount / planned) * 100) : 100;
+
+    // Strict Status Resolution
+    const isCheckedOut = !!att?.check_out_time;
+    const hasCheckedIn = !!att?.check_in_time && !isCheckedOut;
+    let computedStatus: "OFF_DUTY" | "ON_DUTY" | "ON_FIELD" | "VISITING" = "OFF_DUTY";
+
+    if (active) {
+      computedStatus = "VISITING";
+    } else if (hasCheckedIn) {
+      computedStatus = todayVisits.length > 0 ? "ON_FIELD" : "ON_DUTY";
+    } else {
+      computedStatus = "OFF_DUTY";
+    }
+
+    const areaName = db.areas.find((a) => a._id === u.area_id)?.name || "-";
+    const assignedOffice = db.offices.find((o) => o._id === (u.office_id || att?.office_id));
+    const officeName = assignedOffice?.office_name || "Depo Pusat";
+
+    // Most accurate real-time GPS location candidate
     let lastLoc = (u as any).last_location;
+    let locSource = "USER_PING";
+
+    // Check recent GPS events
+    const latestGpsEvent = db.gps_events
+      ?.filter((g) => g.user_id === u._id)
+      ?.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
+
+    if (latestGpsEvent && (!lastLoc || new Date(latestGpsEvent.timestamp).getTime() > new Date(lastLoc.timestamp || 0).getTime())) {
+      lastLoc = {
+        lat: latestGpsEvent.latitude,
+        lng: latestGpsEvent.longitude,
+        latitude: latestGpsEvent.latitude,
+        longitude: latestGpsEvent.longitude,
+        accuracy: latestGpsEvent.accuracy,
+        speed: latestGpsEvent.speed,
+        battery: latestGpsEvent.battery,
+        timestamp: latestGpsEvent.timestamp,
+        source: "GPS_EVENT",
+      };
+      locSource = "GPS_EVENT";
+    }
+
     if (!lastLoc || !lastLoc.lat) {
       if (active && active.check_in_lat) {
-        lastLoc = { lat: active.check_in_lat, lng: active.check_in_lng, timestamp: active.check_in_time, source: "ACTIVE_VISIT" };
+        lastLoc = {
+          lat: active.check_in_lat,
+          lng: active.check_in_lng,
+          latitude: active.check_in_lat,
+          longitude: active.check_in_lng,
+          timestamp: active.check_in_time,
+          source: "ACTIVE_VISIT",
+        };
+        locSource = "ACTIVE_VISIT";
       } else if (todayVisits.length > 0) {
         const latestV = todayVisits[todayVisits.length - 1];
         if (latestV.check_in_lat) {
-          lastLoc = { lat: latestV.check_in_lat, lng: latestV.check_in_lng, timestamp: latestV.check_in_time, source: "LATEST_VISIT" };
+          lastLoc = {
+            lat: latestV.check_in_lat,
+            lng: latestV.check_in_lng,
+            latitude: latestV.check_in_lat,
+            longitude: latestV.check_in_lng,
+            timestamp: latestV.check_in_time,
+            source: "LATEST_VISIT",
+          };
+          locSource = "LATEST_VISIT";
         }
       } else if (att && att.check_in_lat) {
-        lastLoc = { lat: att.check_in_lat, lng: att.check_in_lng, timestamp: att.check_in_time, source: "ATTENDANCE" };
+        lastLoc = {
+          lat: att.check_in_lat,
+          lng: att.check_in_lng,
+          latitude: att.check_in_lat,
+          longitude: att.check_in_lng,
+          timestamp: att.check_in_time,
+          source: "ATTENDANCE_CHECKIN",
+        };
+        locSource = "ATTENDANCE_CHECKIN";
+      } else if (assignedOffice && assignedOffice.latitude) {
+        lastLoc = {
+          lat: assignedOffice.latitude,
+          lng: assignedOffice.longitude,
+          latitude: assignedOffice.latitude,
+          longitude: assignedOffice.longitude,
+          timestamp: new Date().toISOString(),
+          source: "ASSIGNED_OFFICE",
+        };
+        locSource = "ASSIGNED_OFFICE";
       }
     }
 
-    if (lastLoc && !lastLoc.lat && lastLoc.latitude) {
-      lastLoc.lat = lastLoc.latitude;
-      lastLoc.lng = lastLoc.longitude;
+    if (lastLoc) {
+      const numLat = Number(lastLoc.lat || lastLoc.latitude);
+      const numLng = Number(lastLoc.lng || lastLoc.longitude);
+      lastLoc = {
+        lat: numLat,
+        lng: numLng,
+        latitude: numLat,
+        longitude: numLng,
+        accuracy: lastLoc.accuracy,
+        speed: lastLoc.speed,
+        heading: lastLoc.heading,
+        battery: lastLoc.battery,
+        timestamp: lastLoc.timestamp || new Date().toISOString(),
+        source: lastLoc.source || locSource,
+      };
     }
+
+    const activeOutletObj = active ? db.outlets.find((o) => o._id === active.outlet_id) : null;
 
     return {
       salesman_id: u._id,
@@ -5441,21 +6185,38 @@ apiRouter.get("/monitoring/sales", authMiddleware, requireRoles("SUPERVISOR", "A
       name: u.name,
       code: (u as any).code || u._id,
       phone: u.phone,
+      area_id: u.area_id || null,
       area: areaName,
       office_id: u.office_id || null,
       office_name: officeName,
-      status,
+      status: computedStatus,
       attendance_status: att ? att.status : "ABSENT",
       check_in_time: att?.check_in_time || null,
       check_out_time: att?.check_out_time || null,
+      formatted_check_in: att?.check_in_time ? formatDateTimeWIB(att.check_in_time) : "-",
+      formatted_check_out: att?.check_out_time ? formatDateTimeWIB(att.check_out_time) : "-",
+      work_duration_formatted: att?.work_duration_formatted || "-",
+      work_duration_seconds: att?.work_duration_seconds || 0,
+      late_minutes: att?.late_minutes || 0,
       last_location: lastLoc || null,
-      active_outlet: active ? (db.outlets.find((o) => o._id === active.outlet_id)?.outlet_name || null) : null,
+      active_outlet: activeOutletObj ? activeOutletObj.outlet_name : null,
+      active_outlet_code: activeOutletObj ? activeOutletObj.outlet_code : null,
+      active_outlet_address: activeOutletObj ? activeOutletObj.address : null,
       target_volume: tgt.target_volume,
       actual_volume: tgt.actual_volume,
       achievement_percentage: tgt.achievement_percentage,
       achievement_formatted: tgt.achievement_formatted,
       status_label: tgt.status_label,
       visits_trail: todayVisits,
+      call_plan: cp ? {
+        _id: cp._id,
+        date: cp.date,
+        items: enrichedCpItems,
+        planned,
+        visited: visitedCpCount,
+        pending: Math.max(0, planned - visitedCpCount),
+        compliance_percentage: planCompliancePct,
+      } : null,
       summary: {
         planned,
         actual: kpi.outlet_calls,
@@ -5488,9 +6249,26 @@ apiRouter.get("/monitoring/sales", authMiddleware, requireRoles("SUPERVISOR", "A
       sales_value: kpi.total_revenue,
       revenue: kpi.total_revenue,
       missed,
-      active_visit: active ? { ...active, outlet_name: db.outlets.find((o) => o._id === active.outlet_id)?.outlet_name } : null,
+      new_outlets: newOutlets,
+      active_visit: active ? {
+        ...active,
+        outlet_name: activeOutletObj?.outlet_name || "Outlet",
+        outlet_code: activeOutletObj?.outlet_code || "-",
+        address: activeOutletObj?.address || "-",
+        duration_minutes: Math.round((new Date().getTime() - new Date(active.check_in_time).getTime()) / 60000),
+      } : null,
     };
   });
+
+  // Apply status filter if provided
+  let filteredList = salesmenStatus;
+  if (filterStatus && filterStatus !== "ALL") {
+    if (filterStatus === "ACTIVE") {
+      filteredList = filteredList.filter((s) => s.status !== "OFF_DUTY");
+    } else {
+      filteredList = filteredList.filter((s) => s.status === filterStatus);
+    }
+  }
 
   const totalPlanned = salesmenStatus.reduce((sum, s) => sum + (s.planned || 0), 0);
   const totalCalls = salesmenStatus.reduce((sum, s) => sum + (s.outlet_calls || 0), 0);
@@ -5498,17 +6276,33 @@ apiRouter.get("/monitoring/sales", authMiddleware, requireRoles("SUPERVISOR", "A
   const totalVol = salesmenStatus.reduce((sum, s) => sum + (s.volume || 0), 0);
   const totalTargetVol = salesmenStatus.reduce((sum, s) => sum + (s.target_volume || 0), 0);
   const totalRev = salesmenStatus.reduce((sum, s) => sum + (s.sales_value || 0), 0);
+  const totalNewOutlets = salesmenStatus.reduce((sum, s) => sum + (s.new_outlets || 0), 0);
   const overallEcRate = totalCalls > 0 ? Math.round((totalEC / totalCalls) * 1000) / 10 : 0;
   const overallAch = totalTargetVol > 0 ? Math.round((totalVol / totalTargetVol) * 1000) / 10 : 0;
 
+  const visitingCount = salesmenStatus.filter((s) => s.status === "VISITING").length;
+  const onFieldCount = salesmenStatus.filter((s) => s.status === "ON_FIELD").length;
+  const onDutyCount = salesmenStatus.filter((s) => s.status === "ON_DUTY").length;
+  const offDutyCount = salesmenStatus.filter((s) => s.status === "OFF_DUTY").length;
+
   res.json({
-    date: today,
+    date: queryDate,
     period: currentPeriod,
     total_salesmen: salesUsers.length,
-    active_in_field: salesmenStatus.filter((s) => s.status !== "OFF_DUTY").length,
+    active_in_field: visitingCount + onFieldCount + onDutyCount,
+    status_counts: {
+      visiting: visitingCount,
+      on_field: onFieldCount,
+      on_duty: onDutyCount,
+      off_duty: offDutyCount,
+    },
     summary: {
       total_salesmen: salesUsers.length,
-      active_in_field: salesmenStatus.filter((s) => s.status !== "OFF_DUTY").length,
+      active_in_field: visitingCount + onFieldCount + onDutyCount,
+      visiting_count: visitingCount,
+      on_field_count: onFieldCount,
+      on_duty_count: onDutyCount,
+      off_duty_count: offDutyCount,
       total_planned: totalPlanned,
       total_outlet_calls: totalCalls,
       total_effective_calls: totalEC,
@@ -5517,9 +6311,10 @@ apiRouter.get("/monitoring/sales", authMiddleware, requireRoles("SUPERVISOR", "A
       total_target_volume: totalTargetVol,
       overall_achievement: overallAch,
       total_revenue: totalRev,
+      total_new_outlets: totalNewOutlets,
     },
-    items: salesmenStatus,
-    salesmen: salesmenStatus,
+    items: filteredList,
+    salesmen: filteredList,
   });
 });
 
@@ -5694,25 +6489,195 @@ apiRouter.get("/dashboard/owner", authMiddleware, requireRoles("OWNER", "ADMIN")
 // ================= REPORTS =================
 apiRouter.get("/reports", authMiddleware, (req, res) => {
   const reports = [
-    { id: "outlets", name: "Laporan Performa & Status Outlet (NOO, Repeat, Active, Dormant)", category: "OUTLET" },
-    { id: "target-performance", name: "Laporan Target vs Actual Volume & Achievement (SKU / Sales / Area)", category: "SALES" },
-    { id: "call-achievement", name: "Laporan Call Achievement & Rute", category: "SALES" },
-    { id: "effective-call", name: "Laporan Effective Call (EC) & Drop Size", category: "SALES" },
-    { id: "daily-sales", name: "Laporan Harian Penjualan & Kunjungan Sales", category: "SALES" },
-    { id: "sales-performance", name: "Laporan Performa Kinerja Sales", category: "SALES" },
-    { id: "area-performance", name: "Laporan Performa Wilayah / Area", category: "SALES" },
-    { id: "product-coverage", name: "Laporan Performa & Cakupan Produk (SKU)", category: "SALES" },
-    { id: "no-order-analysis", name: "Laporan Analisis Kunjungan Tanpa Order", category: "SALES" },
-    { id: "transactions", name: "Laporan Detail Transaksi Penjualan", category: "SALES" },
-    { id: "attendance", name: "Laporan Absensi & Disiplin Sales", category: "FIELD" },
-    { id: "outlet-coverage", name: "Laporan Cakupan & Produktivitas Outlet", category: "COVERAGE" },
-    { id: "new-outlets", name: "Laporan Penambahan Outlet Baru (NOO)", category: "COVERAGE" },
-    { id: "daily-stock-movement", name: "Laporan Rekap Mutasi Stok Harian", category: "INVENTORY" },
-    { id: "sales-stock-ledger", name: "Laporan Ledger Stok Sales Lapangan", category: "INVENTORY" },
-    { id: "stock-handover", name: "Laporan Serah Terima Stok Pagi (Handover)", category: "INVENTORY" },
-    { id: "sales-return", name: "Laporan Pengembalian / Retur Stok Sales", category: "INVENTORY" },
-    { id: "stock-reconciliation", name: "Laporan Rekonsiliasi & Selisih Stok Harian", category: "INVENTORY" },
-    { id: "inventory", name: "Laporan Stok Gudang & Posisi Sales", category: "INVENTORY" },
+    {
+      id: "outlets",
+      key: "outlets",
+      name: "Laporan Performa & Status Outlet (NOO, Repeat, Active, Dormant)",
+      category: "OUTLET",
+      category_label: "Outlet & Toko",
+      icon: "Store",
+      description: "Analisis siklus hidup toko, transaksi pertama, repeat order, dan status keaktifan.",
+    },
+    {
+      id: "target-performance",
+      key: "target-performance",
+      name: "Laporan Target vs Actual Volume & Achievement (SKU / Sales / Area)",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "TrendingUp",
+      description: "Monitoring pencapaian target volume penjualan per produk, sales rep, dan area.",
+    },
+    {
+      id: "route-performance",
+      key: "route-performance",
+      name: "Laporan Performa Master Rute & Kunjungan Call Plan",
+      category: "FIELD",
+      category_label: "Operasional & Absensi",
+      icon: "Route",
+      description: "Evaluasi efektivitas master rute: outlet count, rasio kunjungan, effective call (EC), dan nilai penjualan.",
+    },
+    {
+      id: "call-plan-detail",
+      key: "call-plan-detail",
+      name: "Laporan Detail Eksekusi Call Plan & Rute Harian",
+      category: "FIELD",
+      category_label: "Operasional & Absensi",
+      icon: "ListChecks",
+      description: "Rincian urutan kunjungan toko dalam call plan, jam check-in/out, durasi, dan status eksekusi.",
+    },
+    {
+      id: "call-achievement",
+      key: "call-achievement",
+      name: "Laporan Call Achievement & Kepatuhan Jadwal",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "Route",
+      description: "Evaluasi rasio rencana kunjungan (Plan) vs realisasi kunjungan harian sales.",
+    },
+    {
+      id: "effective-call",
+      key: "effective-call",
+      name: "Laporan Effective Call (EC) & Drop Size",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "CheckCircle2",
+      description: "Rasio kunjungan yang menghasilkan transaksi (EC) serta nilai penjualan per call.",
+    },
+    {
+      id: "daily-sales",
+      key: "daily-sales",
+      name: "Laporan Harian Penjualan & Kunjungan Sales",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "Calendar",
+      description: "Rekap transaksi dan performa harian tim sales per tanggal kunjungan.",
+    },
+    {
+      id: "sales-performance",
+      key: "sales-performance",
+      name: "Laporan Performa Kinerja Salesman",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "Users",
+      description: "Ringkasan metrik sales: Call, EC, Volume, Revenue, dan Target Achievement.",
+    },
+    {
+      id: "area-performance",
+      key: "area-performance",
+      name: "Laporan Performa Wilayah / Area",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "MapPin",
+      description: "Distribusi penjualan, coverage outlet, dan produktivitas per wilayah/area.",
+    },
+    {
+      id: "product-coverage",
+      key: "product-coverage",
+      name: "Laporan Performa & Cakupan Produk (SKU)",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "Package",
+      description: "Penyebaran dan kontribusi volume per varian produk/SKU ke seluruh outlet.",
+    },
+    {
+      id: "no-order-analysis",
+      key: "no-order-analysis",
+      name: "Laporan Analisis Kunjungan Tanpa Order (No Order)",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "AlertCircle",
+      description: "Analisis alasan toko tidak melakukan pemesanan saat dikunjungi (Open Call).",
+    },
+    {
+      id: "transactions",
+      key: "transactions",
+      name: "Laporan Detail Transaksi Penjualan",
+      category: "SALES",
+      category_label: "Penjualan & Target",
+      icon: "Receipt",
+      description: "Daftar invoice transaksi penjualan tunai & tempo lengkap dengan detail produk.",
+    },
+    {
+      id: "attendance",
+      key: "attendance",
+      name: "Laporan Absensi & Disiplin Sales",
+      category: "FIELD",
+      category_label: "Operasional & Absensi",
+      icon: "Clock",
+      description: "Rekap jam check-in, check-out, radius GPS, dan status kehadiran tim sales.",
+    },
+    {
+      id: "outlet-coverage",
+      key: "outlet-coverage",
+      name: "Laporan Cakupan & Produktivitas Outlet",
+      category: "OUTLET",
+      category_label: "Outlet & Toko",
+      icon: "Layers",
+      description: "Cakupan kunjungan dan transaksi per outlet dalam periode terpilih.",
+    },
+    {
+      id: "new-outlets",
+      key: "new-outlets",
+      name: "Laporan Penambahan Outlet Baru (NOO)",
+      category: "OUTLET",
+      category_label: "Outlet & Toko",
+      icon: "Store",
+      description: "Daftar registrasi toko baru yang berhasil dibuka oleh sales di lapangan.",
+    },
+    {
+      id: "daily-stock-movement",
+      key: "daily-stock-movement",
+      name: "Laporan Rekap Mutasi Stok Harian",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "ArrowUpDown",
+      description: "Log perpindahan stok: Transfer In (Handover), Sales Out, dan Retur.",
+    },
+    {
+      id: "sales-stock-ledger",
+      key: "sales-stock-ledger",
+      name: "Laporan Ledger Stok Sales Lapangan",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "FileSpreadsheet",
+      description: "Buku besar stok di tangan sales, barang terjual, dan sisa fisik harian.",
+    },
+    {
+      id: "stock-handover",
+      key: "stock-handover",
+      name: "Laporan Serah Terima Stok Pagi (Handover)",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "PackageCheck",
+      description: "Daftar berita acara serah terima muatan stok awal dari gudang ke sales.",
+    },
+    {
+      id: "sales-return",
+      key: "sales-return",
+      name: "Laporan Pengembalian / Retur Stok Sales",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "RotateCcw",
+      description: "Daftar pengembalian sisa stok atau barang retur dari sales ke gudang.",
+    },
+    {
+      id: "stock-reconciliation",
+      key: "stock-reconciliation",
+      name: "Laporan Rekonsiliasi & Selisih Stok Harian",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "Scale",
+      description: "Audit selisih antara sisa seharusnya vs fisik aktual pada akhir hari.",
+    },
+    {
+      id: "inventory",
+      key: "inventory",
+      name: "Laporan Stok Gudang & Posisi Sales",
+      category: "INVENTORY",
+      category_label: "Stok & Gudang",
+      icon: "Boxes",
+      description: "Posisi aset stok real-time di gudang pusat dan tersebar di tim sales.",
+    },
   ];
   res.json(reports);
 });
@@ -6409,11 +7374,113 @@ apiRouter.get("/reports/:rtype", authMiddleware, (req: AuthenticatedRequest, res
   const salesmanId = req.user!.role === "SALES" ? req.user!._id : (rawSalesmanId === "ALL" ? "" : rawSalesmanId);
   const areaId = req.query.area_id as string;
   const skuId = req.query.sku_id as string;
+  const routeId = req.query.route_id as string;
   const period = (req.query.period as string) || from.slice(0, 7);
 
   let data: any[] = [];
 
   switch (rtype) {
+    case "route-performance": {
+      // Aggregate performance per master route
+      const routesList = db.routes.filter((r) => {
+        if (routeId && routeId !== "ALL" && r._id !== routeId) return false;
+        if (areaId && areaId !== "ALL" && r.area_id !== areaId) return false;
+        if (salesmanId && r.salesman_id && r.salesman_id !== salesmanId) return false;
+        return true;
+      });
+
+      data = routesList.map((r) => {
+        const area = r.area_id ? db.areas.find((a) => a._id === r.area_id) : null;
+        const sales = r.salesman_id ? db.users.find((u) => u._id === r.salesman_id) : null;
+        const routeOutlets = db.outlets.filter((o) => o.route_id === r._id);
+        const outletIds = new Set(routeOutlets.map((o) => o._id));
+
+        // Calls & visits on this route
+        const visits = db.visits.filter((v) => {
+          if (!outletIds.has(v.outlet_id)) return false;
+          if (v.date < from || v.date > to) return false;
+          if (salesmanId && v.salesman_id !== salesmanId) return false;
+          return v.status === "COMPLETED";
+        });
+
+        // Transactions on this route
+        const txns = db.transactions.filter((t) => {
+          if (!outletIds.has(t.outlet_id)) return false;
+          const d = (t.transaction_date || "").slice(0, 10);
+          if (d < from || d > to) return false;
+          if (salesmanId && t.salesman_id !== salesmanId) return false;
+          return t.status !== "CANCELLED" && (t as any).status !== "DRAFT";
+        });
+
+        const effectiveVisits = visits.filter((v) => v.call_result === "EFFECTIVE" || txns.some((t) => t.visit_id === v._id));
+        const totalVol = txns.reduce((s, t) => s + (t.total_volume ?? (t.items || []).reduce((is, it) => is + (Number(it.quantity) || 0), 0)), 0);
+        const totalRev = txns.reduce((s, t) => s + (Number(t.total) || 0), 0);
+        const ecRate = visits.length > 0 ? Math.round((effectiveVisits.length / visits.length) * 100) : 0;
+        const dropSize = txns.length > 0 ? Math.round(totalRev / txns.length) : 0;
+
+        return {
+          "Kode Rute": r.code || r._id,
+          "Nama Rute": r.name,
+          "Area / Wilayah": area?.name || "-",
+          "Salesman Penanggung Jawab": sales?.name || "-",
+          "Hari Kunjungan": r.day_of_week || "-",
+          "Total Toko / Outlet": routeOutlets.length,
+          "Total Kunjungan (Call)": visits.length,
+          "Effective Call (EC)": effectiveVisits.length,
+          "EC Rate (Strike Rate %)": `${ecRate}%`,
+          "Total Transaksi": txns.length,
+          "Volume Terjual (Qty)": totalVol,
+          "Total Omset / Revenue (Rp)": totalRev,
+          "Rata-rata Drop Size (Rp)": dropSize,
+          Status: r.status || "ACTIVE",
+        };
+      });
+      break;
+    }
+
+    case "call-plan-detail": {
+      // Detailed daily execution of call plan items
+      const plans = db.call_plans.filter((p) => {
+        if (p.date < from || p.date > to) return false;
+        if (salesmanId && p.salesman_id !== salesmanId) return false;
+        if (routeId && routeId !== "ALL" && p.route_id !== routeId) return false;
+        return true;
+      });
+
+      const planIds = new Set(plans.map((p) => p._id));
+      const planItems = db.call_plan_items.filter((i) => planIds.has(i.call_plan_id));
+
+      data = planItems.map((item) => {
+        const plan = plans.find((p) => p._id === item.call_plan_id);
+        const sales = plan ? db.users.find((u) => u._id === plan.salesman_id) : null;
+        const outlet = db.outlets.find((o) => o._id === item.outlet_id);
+        const route = plan?.route_id ? db.routes.find((r) => r._id === plan.route_id) : (outlet?.route_id ? db.routes.find((r) => r._id === outlet.route_id) : null);
+        const area = outlet?.area_id ? db.areas.find((a) => a._id === outlet.area_id) : (sales?.area_id ? db.areas.find((a) => a._id === sales.area_id) : null);
+        const visit = plan ? db.visits.find((v) => v.salesman_id === plan.salesman_id && v.date === plan.date && v.outlet_id === item.outlet_id) : null;
+
+        const isVisited = item.status === "VISITED" || visit?.status === "COMPLETED";
+        const isEffective = visit?.call_result === "EFFECTIVE" || ((visit?.total_sales || 0) > 0);
+
+        return {
+          Tanggal: plan?.date || "-",
+          "Kode Plan": plan?.plan_code || item.call_plan_id,
+          Salesman: sales?.name || "-",
+          "Rute Kunjungan": route?.name || "-",
+          Urutan: item.sequence || 1,
+          "Kode Outlet": outlet?.outlet_code || item.outlet_id,
+          "Nama Outlet": outlet?.outlet_name || "-",
+          Alamat: outlet?.address || "-",
+          Wilayah: area?.name || "-",
+          Prioritas: (item as any).priority || "NORMAL",
+          "Status Plan": isEffective ? "EFFECTIVE (ORDER)" : (isVisited ? "SELESAI KUNJUNGAN" : "PENDING"),
+          "Jam Check-In": visit?.check_in_time ? new Date(visit.check_in_time).toLocaleTimeString("id-ID") : "-",
+          "Jam Check-Out": visit?.check_out_time ? new Date(visit.check_out_time).toLocaleTimeString("id-ID") : "-",
+          "Durasi (Menit)": visit?.duration_seconds ? Math.round(visit.duration_seconds / 60) : 0,
+          "Total Penjualan (Rp)": visit?.total_sales || 0,
+        };
+      });
+      break;
+    }
     case "outlets":
     case "outlet-report": {
       // Re-use standard calculation logic for generic reports export
@@ -7125,13 +8192,22 @@ export function syncSalesStockLedger(salesmanId: string, skuId: string, business
     .filter((m) => m.business_date === businessDate && m.salesman_id === salesmanId && m.sku_id === skuId && m.movement_type === "RETURN_IN" && m.status === "COMPLETED")
     .reduce((sum, m) => sum + m.quantity, 0);
 
-  // 4. Current physical stock in sales inventory
+  // 4. Calculate adjustments (ADJUSTMENT_IN / ADJUSTMENT_OUT) on this business date
+  const adjustmentsIn = db.stock_movements
+    .filter((m) => m.business_date === businessDate && m.salesman_id === salesmanId && m.sku_id === skuId && m.movement_type === "ADJUSTMENT_IN" && m.status === "COMPLETED")
+    .reduce((sum, m) => sum + m.quantity, 0);
+
+  const adjustmentsOut = db.stock_movements
+    .filter((m) => m.business_date === businessDate && m.salesman_id === salesmanId && m.sku_id === skuId && m.movement_type === "ADJUSTMENT_OUT" && m.status === "COMPLETED")
+    .reduce((sum, m) => sum + m.quantity, 0);
+
+  // 5. Current physical stock in sales inventory
   const salesInv = db.inventory.find(
     (i) => i.location_type === "SALES" && i.location_id === salesmanId && i.sku_id === skuId
   );
   const closingBalance = salesInv ? salesInv.available_stock : 0;
 
-  // 5. Existing ledger record or calculate opening balance
+  // 6. Existing ledger record or calculate opening balance
   let ledger = db.sales_stock_ledgers.find((l) => l._id === ledgerId);
   let openingBalance = 0;
 
@@ -7147,7 +8223,7 @@ export function syncSalesStockLedger(salesmanId: string, skuId: string, business
     }
   }
 
-  const expectedBalance = Math.max(0, openingBalance + transfersIn - salesOut - returnsOut);
+  const expectedBalance = Math.max(0, openingBalance + transfersIn + adjustmentsIn - salesOut - returnsOut - adjustmentsOut);
   const discrepancy = closingBalance - expectedBalance;
   const status = discrepancy === 0 ? "BALANCED" : (discrepancy > 0 ? "SURPLUS" : "DEFICIT");
 
@@ -7189,6 +8265,7 @@ export function syncSalesStockLedger(salesmanId: string, skuId: string, business
     ledger.updated_at = nowStr;
   }
 
+  syncSingleDoc("sales_stock_ledgers", ledger._id, ledger);
   return ledger;
 }
 
@@ -8007,20 +9084,45 @@ apiRouter.get("/sales/stock/daily-ledger", authMiddleware, (req: AuthenticatedRe
         )
         .reduce((sum, m) => sum + m.quantity, 0);
 
-      // 4. Current physical stock in sales inventory
+      // 4. Calculate adjustments (ADJUSTMENT_IN / ADJUSTMENT_OUT) within date range
+      const adjustmentsIn = db.stock_movements
+        .filter(
+          (m) =>
+            m.business_date >= from &&
+            m.business_date <= to &&
+            m.salesman_id === sales._id &&
+            m.sku_id === sku._id &&
+            m.movement_type === "ADJUSTMENT_IN" &&
+            m.status === "COMPLETED"
+        )
+        .reduce((sum, m) => sum + m.quantity, 0);
+
+      const adjustmentsOut = db.stock_movements
+        .filter(
+          (m) =>
+            m.business_date >= from &&
+            m.business_date <= to &&
+            m.salesman_id === sales._id &&
+            m.sku_id === sku._id &&
+            m.movement_type === "ADJUSTMENT_OUT" &&
+            m.status === "COMPLETED"
+        )
+        .reduce((sum, m) => sum + m.quantity, 0);
+
+      // 5. Current physical stock in sales inventory
       const salesInv = db.inventory.find(
         (i) => i.location_type === "SALES" && i.location_id === sales._id && i.sku_id === sku._id
       );
       const closingBalance = salesInv ? salesInv.available_stock : 0;
 
-      // 5. Opening balance: get from ledger before date range or calculate
+      // 6. Opening balance: get from ledger before date range or calculate
       const prevLedger = db.sales_stock_ledgers
         .filter((l) => l.salesman_id === sales._id && l.sku_id === sku._id && l.business_date < from)
         .sort((a, b) => b.business_date.localeCompare(a.business_date))[0];
       const openingBalance = prevLedger ? prevLedger.closing_balance || 0 : 0;
 
-      // Mathematical formula: Opening + Transfer In - Sales Out - Return = Expected Closing
-      const expectedBalance = Math.max(0, openingBalance + transfersIn - salesOut - returnsOut);
+      // Mathematical formula: Opening + Transfer In + Adj In - Sales Out - Return - Adj Out = Expected Closing
+      const expectedBalance = Math.max(0, openingBalance + transfersIn + adjustmentsIn - salesOut - returnsOut - adjustmentsOut);
       const discrepancy = closingBalance - expectedBalance;
       const status = discrepancy === 0 ? "BALANCED" : (discrepancy > 0 ? "SURPLUS" : "DEFICIT");
 

@@ -199,16 +199,10 @@ export default function App() {
               </ProtectedRoute>
             }
           />
-          <Route
-            path="/admin/outlets"
-            element={
-              <ProtectedRoute allowedRoles={["SUPERVISOR", "ADMIN", "OWNER"]}>
-                <DesktopLayout title="Master Outlet & Lifecycle">
-                  <MasterOutletPage />
-                </DesktopLayout>
-              </ProtectedRoute>
-            }
-          />
+          {/* Alias redirect for legacy/alternative master outlet routes */}
+          <Route path="/admin/outlets" element={<Navigate to="/master-outlets" replace />} />
+          <Route path="/outlets-master" element={<Navigate to="/master-outlets" replace />} />
+
           <Route
             path="/admin/masters"
             element={
@@ -219,6 +213,12 @@ export default function App() {
               </ProtectedRoute>
             }
           />
+          {/* Master data alias routes */}
+          <Route path="/routes" element={<Navigate to="/admin/masters?tab=routes" replace />} />
+          <Route path="/rute" element={<Navigate to="/admin/masters?tab=routes" replace />} />
+          <Route path="/admin/routes" element={<Navigate to="/admin/masters?tab=routes" replace />} />
+          <Route path="/masters" element={<Navigate to="/admin/masters" replace />} />
+
           <Route
             path="/settings/company"
             element={
@@ -229,16 +229,10 @@ export default function App() {
               </ProtectedRoute>
             }
           />
-          <Route
-            path="/admin/company-profile"
-            element={
-              <ProtectedRoute allowedRoles={["ADMIN", "OWNER", "SUPERVISOR", "WAREHOUSE", "SALES"]}>
-                <DesktopLayout title="Profil Perusahaan">
-                  <CompanyProfilePage />
-                </DesktopLayout>
-              </ProtectedRoute>
-            }
-          />
+          {/* Alias redirect for company profile */}
+          <Route path="/admin/company-profile" element={<Navigate to="/settings/company" replace />} />
+          <Route path="/company-profile" element={<Navigate to="/settings/company" replace />} />
+
           <Route
             path="/admin/settings"
             element={
@@ -249,6 +243,8 @@ export default function App() {
               </ProtectedRoute>
             }
           />
+          <Route path="/settings" element={<Navigate to="/admin/settings" replace />} />
+
           <Route
             path="/reports/outlets"
             element={
@@ -259,26 +255,10 @@ export default function App() {
               </ProtectedRoute>
             }
           />
-          <Route
-            path="/reports/outlet"
-            element={
-              <ProtectedRoute allowedRoles={["OWNER", "ADMIN", "SUPERVISOR", "SALES"]}>
-                <DesktopLayout title="Laporan Outlet">
-                  <OutletReportPage />
-                </DesktopLayout>
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/reports/outlet-report"
-            element={
-              <ProtectedRoute allowedRoles={["OWNER", "ADMIN", "SUPERVISOR", "SALES"]}>
-                <DesktopLayout title="Laporan Outlet">
-                  <OutletReportPage />
-                </DesktopLayout>
-              </ProtectedRoute>
-            }
-          />
+          {/* Alias redirects for outlet report routes */}
+          <Route path="/reports/outlet" element={<Navigate to="/reports/outlets" replace />} />
+          <Route path="/reports/outlet-report" element={<Navigate to="/reports/outlets" replace />} />
+
           <Route
             path="/reports"
             element={

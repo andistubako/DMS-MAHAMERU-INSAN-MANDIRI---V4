@@ -149,8 +149,10 @@ export interface CallPlan {
   plan_code: string;
   salesman_id: string;
   date: string;
+  route_id?: string;
   status: "DRAFT" | "PUBLISHED" | "COMPLETED";
   total_outlets: number;
+  notes?: string;
   created_at: string;
   created_by: string;
 }

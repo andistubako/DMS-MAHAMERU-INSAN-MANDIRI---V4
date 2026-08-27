@@ -21,6 +21,12 @@ import {
   AlertCircle,
   ExternalLink,
   ChevronRight,
+  Battery,
+  Navigation,
+  Calendar,
+  Building2,
+  ShieldAlert,
+  Info,
 } from "lucide-react";
 import api, { errMsg } from "../../lib/api";
 import StatusBadge from "../../components/StatusBadge";
@@ -45,36 +51,40 @@ import {
   DialogDescription,
 } from "../../components/ui/dialog";
 
-const STATUS_LABEL = {
-  OFF_DUTY: "Off Duty",
-  ON_DUTY: "On Duty",
-  ON_FIELD: "On Field",
-  VISITING: "Sedang Kunjungan",
-  RETURNING: "Perjalanan Pulang",
+const STATUS_CONFIG = {
+  OFF_DUTY: { label: "Off Duty", badge: "OFF_DUTY", color: "bg-slate-100 text-slate-700 border-slate-300" },
+  ON_DUTY: { label: "Standby Depo", badge: "ON_DUTY", color: "bg-blue-100 text-blue-800 border-blue-300" },
+  ON_FIELD: { label: "On Field", badge: "ON_FIELD", color: "bg-amber-100 text-amber-800 border-amber-300" },
+  VISITING: { label: "Sedang Visit", badge: "VISITING", color: "bg-emerald-100 text-emerald-800 border-emerald-300" },
 };
 
 export default function MonitoringPage() {
   const [data, setData] = useState({ items: [], summary: {} });
   const [pending, setPending] = useState([]);
   const [offices, setOffices] = useState([]);
+  const [areas, setAreas] = useState([]);
   const [visits, setVisits] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
+  const [selectedDate, setSelectedDate] = useState(todayLocal());
   const [statusFilter, setStatusFilter] = useState("ALL");
+  const [areaFilter, setAreaFilter] = useState("ALL");
+  const [officeFilter, setOfficeFilter] = useState("ALL");
   const [selectedSalesman, setSelectedSalesman] = useState(null);
   const [mapFocus, setMapFocus] = useState(null);
-  const [refreshIntervalSec, setRefreshIntervalSec] = useState(10); // Default 10s for real-time
+  const [refreshIntervalSec, setRefreshIntervalSec] = useState(10);
   const [autoRefreshSec, setAutoRefreshSec] = useState(10);
   const [lastSyncTime, setLastSyncTime] = useState(new Date());
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [m, p, o, v] = await Promise.all([
-        api.get("/monitoring/sales"),
+      const [m, p, o, a, v] = await Promise.all([
+        api.get("/monitoring/sales", { params: { date: selectedDate } }),
         api.get("/outlets/pending"),
         api.get("/offices"),
-        api.get("/visits", { params: { date: todayLocal(), limit: 200 } }),
+        api.get("/areas").catch(() => ({ data: { items: [] } })),
+        api.get("/visits", { params: { date: selectedDate, limit: 300 } }),
       ]);
 
       const salesList = Array.isArray(m.data?.items)
@@ -89,26 +99,28 @@ export default function MonitoringPage() {
       });
       setPending(Array.isArray(p.data?.items) ? p.data.items : []);
       setOffices(Array.isArray(o.data?.items) ? o.data.items : []);
+      setAreas(Array.isArray(a.data?.items) ? a.data.items : []);
       setVisits(Array.isArray(v.data?.items) ? v.data.items : []);
       setLastSyncTime(new Date());
     } catch (e) {
       if (!silent) toast.error(errMsg(e));
     }
     if (!silent) setLoading(false);
-  }, []);
+  }, [selectedDate]);
 
   useEffect(() => {
     load(false);
   }, [load]);
 
+  // Live Auto-Refresh Interval
   useEffect(() => {
     setAutoRefreshSec(refreshIntervalSec);
-    if (refreshIntervalSec === 0) return; // Manual mode
+    if (refreshIntervalSec === 0) return;
 
     const interval = setInterval(() => {
       setAutoRefreshSec((prev) => {
         if (prev <= 1) {
-          load(true); // Silent background fetch without disturbing UI
+          load(true);
           return refreshIntervalSec;
         }
         return prev - 1;
@@ -118,11 +130,12 @@ export default function MonitoringPage() {
     return () => clearInterval(interval);
   }, [load, refreshIntervalSec]);
 
+  // Approve / Reject NOO Outlets
   const approve = async (id) => {
     try {
       await api.post(`/outlets/${id}/approve`);
-      toast.success("Outlet berhasil disetujui.");
-      load();
+      toast.success("Outlet berhasil diverifikasi & disetujui.");
+      load(true);
     } catch (e) {
       toast.error(errMsg(e));
     }
@@ -130,20 +143,21 @@ export default function MonitoringPage() {
 
   const reject = async (id) => {
     try {
-      await api.post(`/outlets/${id}/reject`, { reason: "Ditolak supervisor" });
-      toast.success("Outlet ditolak.");
-      load();
+      await api.post(`/outlets/${id}/reject`, { reason: "Ditolak supervisor lapangan" });
+      toast.success("Pengajuan outlet ditolak.");
+      load(true);
     } catch (e) {
       toast.error(errMsg(e));
     }
   };
 
   const safeOffices = Array.isArray(offices) ? offices : [];
+  const safeAreas = Array.isArray(areas) ? areas : [];
   const safeItems = Array.isArray(data.items) ? data.items : [];
   const safeVisits = Array.isArray(visits) ? visits : [];
   const safePending = Array.isArray(pending) ? pending : [];
 
-  // Filtered sales items
+  // Filtered Salesmen list
   const filteredSales = useMemo(() => {
     return safeItems.filter((s) => {
       const matchQuery =
@@ -151,6 +165,7 @@ export default function MonitoringPage() {
         (s.name || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
         (s.code || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
         (s.area || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (s.office_name || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
         (s.active_outlet || "").toLowerCase().includes(searchQuery.toLowerCase());
 
       const matchStatus =
@@ -158,11 +173,17 @@ export default function MonitoringPage() {
         (statusFilter === "ACTIVE" && s.status !== "OFF_DUTY") ||
         s.status === statusFilter;
 
-      return matchQuery && matchStatus;
-    });
-  }, [safeItems, searchQuery, statusFilter]);
+      const matchArea =
+        areaFilter === "ALL" || s.area_id === areaFilter || s.area === areaFilter;
 
-  // Overall KPI computations
+      const matchOffice =
+        officeFilter === "ALL" || s.office_id === officeFilter;
+
+      return matchQuery && matchStatus && matchArea && matchOffice;
+    });
+  }, [safeItems, searchQuery, statusFilter, areaFilter, officeFilter]);
+
+  // Overall KPIs calculations
   const totalSalesmen = safeItems.length;
   const activeInField = safeItems.filter((s) => s.status !== "OFF_DUTY").length;
   const totalPlanned = safeItems.reduce((acc, s) => acc + (s.planned || 0), 0);
@@ -172,19 +193,23 @@ export default function MonitoringPage() {
   const totalVol = safeItems.reduce((acc, s) => acc + (s.volume || s.actual_volume || 0), 0);
   const totalRevenue = safeItems.reduce((acc, s) => acc + (s.sales_value || s.revenue || 0), 0);
 
-  // Map markers and polylines
+  // Map Center resolution
   const mapCenter = useMemo(() => {
     if (mapFocus) return [mapFocus.lat, mapFocus.lng];
+    if (selectedSalesman?.last_location?.lat) {
+      return [selectedSalesman.last_location.lat, selectedSalesman.last_location.lng];
+    }
     if (safeOffices[0]?.latitude) return [safeOffices[0].latitude, safeOffices[0].longitude];
-    const firstSalesLoc = safeItems.find((s) => s.last_location?.lat)?.last_location;
-    if (firstSalesLoc) return [firstSalesLoc.lat, firstSalesLoc.lng];
-    return [-6.2146, 106.8451];
-  }, [mapFocus, safeOffices, safeItems]);
+    const firstLoc = safeItems.find((s) => s.last_location?.lat)?.last_location;
+    if (firstLoc) return [firstLoc.lat, firstLoc.lng];
+    return [-6.2146, 106.8451]; // Default fallback Jabodetabek
+  }, [mapFocus, selectedSalesman, safeOffices, safeItems]);
 
+  // Interactive Markers for MapView
   const markers = useMemo(() => {
     const list = [];
 
-    // Office Markers
+    // 1. Office / Depo HQ Markers
     safeOffices
       .filter((o) => o && o.latitude)
       .forEach((o, idx) => {
@@ -193,33 +218,32 @@ export default function MonitoringPage() {
           lat: o.latitude,
           lng: o.longitude,
           type: "OFFICE",
-          title: o.office_name || "Kantor Pusat Mahameru",
-          subtitle: o.office_code ? `Kode: ${o.office_code}` : "Kantor Depo Distribusi",
+          title: o.office_name || "Depo Distribusi Mahameru",
+          subtitle: `Kode: ${o.office_code || "-"} · Radius Geofence: ${o.attendance_radius || o.radius_m || 100}m`,
           status: o.status || "ACTIVE",
-          statusLabel: o.status === "ACTIVE" ? "Kantor Aktif" : "Non-Aktif",
+          statusLabel: o.status === "ACTIVE" ? "Depo Aktif" : "Non-Aktif",
           color: "#0A2540",
           badge: "HQ",
-          address: o.address || "Jawa Barat, Indonesia",
-          radius: o.attendance_radius || o.radius_m || 200,
-          checkInWindow: `${o.check_in_end ? `Maks. ${o.check_in_end}` : "08:15"} (Check-Out: ${o.check_out_start || "16:00"} - ${o.check_out_end || "23:00"})`,
+          address: o.address || "-",
+          radius: o.attendance_radius || o.radius_m || 100,
           googleMapsUrl: `https://www.google.com/maps?q=${o.latitude},${o.longitude}`,
         });
       });
 
-    // If a single salesman is selected, prioritize their trail and current location
+    // 2. Focused Salesman View (Shows their path & stops)
     if (selectedSalesman) {
       const s = selectedSalesman;
       if (s.last_location && s.last_location.lat) {
         list.push({
-          id: `sales-focus-${s.salesman_id}`,
+          id: `sales-focus-${s.salesman_id || s._id}`,
           lat: s.last_location.lat,
           lng: s.last_location.lng,
           type: "SALESMAN",
           title: s.name,
-          subtitle: `Area: ${s.area || "Umum"} · Kode: ${s.code || "-"}`,
+          subtitle: `Area: ${s.area || "Umum"} · Status: ${STATUS_CONFIG[s.status]?.label || s.status}`,
           phone: s.phone,
           status: s.status,
-          statusLabel: STATUS_LABEL[s.status] || "Aktif Lapangan",
+          statusLabel: STATUS_CONFIG[s.status]?.label || "Aktif",
           color: "#C5A059",
           badge: s.name ? s.name.charAt(0).toUpperCase() : "S",
           isPulsing: true,
@@ -242,34 +266,29 @@ export default function MonitoringPage() {
         });
       }
 
-      // Add their specific visits
+      // Trail of today's visits for this selected salesman
       const trail = Array.isArray(s.visits_trail) ? s.visits_trail : [];
       trail.forEach((v, idx) => {
         if (v.check_in_lat && v.check_in_lng) {
           const isEC = v.call_result === "EFFECTIVE";
           list.push({
-            id: `visit-trail-${v._id || idx}`,
+            id: `trail-stop-${v._id || idx}`,
             lat: v.check_in_lat,
             lng: v.check_in_lng,
             type: "VISIT",
             title: v.outlet_name || "Outlet Mahameru",
-            subtitle: `Urutan Visit #${idx + 1} · ${v.outlet_code || "OUT"}`,
+            subtitle: `Urutan #${idx + 1} · ${v.outlet_code || "-"} · ${isEC ? "Order Berhasil" : "Non-Order"}`,
             salesmanName: s.name,
             phone: v.phone || v.outlet_phone,
             address: v.address || v.outlet_address,
             callResult: v.call_result || (isEC ? "EFFECTIVE" : "OPEN"),
-            statusLabel: isEC ? "Effective Call (Order)" : "Open Call (Non-EC)",
+            statusLabel: isEC ? "Effective Call (EC)" : "Open Call (Non-EC)",
             color: isEC ? "#10B981" : "#F59E0B",
             badge: `${idx + 1}`,
-            checkInTime: v.check_in_time
-              ? new Date(v.check_in_time).toLocaleTimeString("id-ID", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })
-              : null,
-            revenue: v.revenue || v.order_total || 0,
+            checkInTime: v.check_in_time ? fmtTime(v.check_in_time) : null,
+            revenue: v.revenue || 0,
             volume: v.volume || 0,
-            reason: v.open_call_reason || v.reason || v.notes,
+            reason: v.open_call_reason || v.notes,
             googleMapsUrl: `https://www.google.com/maps?q=${v.check_in_lat},${v.check_in_lng}`,
           });
         }
@@ -278,39 +297,32 @@ export default function MonitoringPage() {
       return list;
     }
 
-    // All Salesmen Locations
-    safeItems
+    // 3. All Salesmen Real-time Locations
+    filteredSales
       .filter((s) => s && s.last_location && s.last_location.lat)
       .forEach((s, idx) => {
         const isVisiting = s.status === "VISITING";
         const isOnField = s.status === "ON_FIELD";
-        const color = isVisiting ? "#3B82F6" : isOnField ? "#C5A059" : "#64748B";
+        const color = isVisiting ? "#10B981" : isOnField ? "#C5A059" : "#64748B";
 
         list.push({
-          id: `sales-marker-${s._id || s.salesman_id || idx}`,
+          id: `sales-pos-${s._id || s.salesman_id || idx}`,
           lat: s.last_location.lat,
           lng: s.last_location.lng,
           type: "SALESMAN",
           title: s.name,
-          subtitle: `Area: ${s.area || "Umum"} · ${s.code || "Sales"}`,
+          subtitle: `${s.area || "Area"} · ${s.active_outlet ? `Di: ${s.active_outlet}` : STATUS_CONFIG[s.status]?.label || s.status}`,
           phone: s.phone,
           status: s.status,
-          statusLabel: STATUS_LABEL[s.status] || "Aktif Lapangan",
-          color: color,
+          statusLabel: STATUS_CONFIG[s.status]?.label || s.status,
+          color,
           badge: s.name ? s.name.charAt(0).toUpperCase() : "S",
           isPulsing: isVisiting || isOnField,
           metrics: {
             effectiveCalls: s.effective_calls || s.effective || 0,
             totalCalls: s.outlet_calls || s.actual || 0,
             plannedCalls: s.planned || 0,
-            ecRate:
-              (s.outlet_calls || s.actual || 0) > 0
-                ? Math.round(
-                    ((s.effective_calls || s.effective || 0) /
-                      (s.outlet_calls || s.actual || 0)) *
-                      100
-                  )
-                : 0,
+            ecRate: s.ec_rate || 0,
             volume: s.volume || s.actual_volume || 0,
             revenue: s.sales_value || s.revenue || 0,
           },
@@ -320,7 +332,7 @@ export default function MonitoringPage() {
         });
       });
 
-    // Today's Visits
+    // 4. Overall Today's Outlet Visits
     safeVisits
       .filter((v) => v && v.check_in_lat)
       .forEach((v, idx) => {
@@ -329,41 +341,35 @@ export default function MonitoringPage() {
         const color = isEC ? "#10B981" : isOpen ? "#F59E0B" : "#3B82F6";
 
         list.push({
-          id: `visit-marker-${v._id || idx}`,
+          id: `visit-pin-${v._id || idx}`,
           lat: v.check_in_lat,
           lng: v.check_in_lng,
           type: "VISIT",
           title: v.outlet_name || "Outlet Mahameru",
-          subtitle: `Kode: ${v.outlet_code || "OUT"} · Channel: ${v.channel_name || "Retail"}`,
-          salesmanName: v.salesman_name || "Sales Lapangan",
+          subtitle: `${v.salesman_name || "Sales"} · ${isEC ? "Order Sukses" : "Kunjungan Toko"}`,
+          salesmanName: v.salesman_name || "-",
           phone: v.phone || v.outlet_phone,
           address: v.address || v.outlet_address,
-          ownerName: v.owner_name,
           callResult: v.call_result || (isEC ? "EFFECTIVE" : "OPEN"),
-          statusLabel: isEC ? "Effective Call (Order)" : isOpen ? "Open Call (Non-EC)" : "Kunjungan",
-          color: color,
+          statusLabel: isEC ? "Effective Call (EC)" : "Open Call (Non-EC)",
+          color,
           badge: isEC ? "EC" : "NC",
-          checkInTime: v.check_in_time
-            ? new Date(v.check_in_time).toLocaleTimeString("id-ID", {
-                hour: "2-digit",
-                minute: "2-digit",
-              })
-            : null,
-          revenue: v.revenue || v.order_total || 0,
+          checkInTime: v.check_in_time ? fmtTime(v.check_in_time) : null,
+          revenue: v.revenue || 0,
           volume: v.volume || 0,
-          reason: v.open_call_reason || v.reason || v.notes,
           googleMapsUrl: `https://www.google.com/maps?q=${v.check_in_lat},${v.check_in_lng}`,
         });
       });
 
     return list;
-  }, [safeOffices, safeItems, safeVisits, selectedSalesman]);
+  }, [safeOffices, filteredSales, safeVisits, selectedSalesman]);
 
+  // Office geofence circles
   const circles = useMemo(() => {
     return safeOffices
       .filter((o) => o && o.latitude)
       .map((o, idx) => ({
-        id: `office-circle-${o._id || idx}`,
+        id: `geofence-circle-${o._id || idx}`,
         lat: o.latitude,
         lng: o.longitude,
         radius: o.attendance_radius || o.radius_m || 100,
@@ -371,7 +377,7 @@ export default function MonitoringPage() {
       }));
   }, [safeOffices]);
 
-  // Polylines for selected salesman trail
+  // Polyline path for selected salesman trail
   const polylines = useMemo(() => {
     if (!selectedSalesman || !selectedSalesman.visits_trail) return [];
     const trail = selectedSalesman.visits_trail;
@@ -395,7 +401,7 @@ export default function MonitoringPage() {
 
     return [
       {
-        id: `trail-${selectedSalesman.salesman_id}`,
+        id: `trail-poly-${selectedSalesman.salesman_id || selectedSalesman._id}`,
         positions,
         color: "#C5A059",
         weight: 4,
@@ -405,20 +411,22 @@ export default function MonitoringPage() {
     ];
   }, [selectedSalesman]);
 
-  // Export summary to CSV
+  // Export CSV
   const exportToCSV = () => {
-    if (safeItems.length === 0) {
+    if (filteredSales.length === 0) {
       toast.error("Tidak ada data monitoring sales untuk diexport.");
       return;
     }
 
     const headers = [
       "Nama Sales",
-      "Kode",
+      "Kode Sales",
       "Area",
-      "Kantor/Depo",
-      "Status",
+      "Kantor / Depo",
+      "Status Live",
       "Absen Masuk",
+      "Absen Pulang",
+      "Durasi Kerja",
       "Planned Calls",
       "Outlet Calls",
       "Effective Calls (EC)",
@@ -426,17 +434,19 @@ export default function MonitoringPage() {
       "Target Vol (Qty)",
       "Actual Vol (Qty)",
       "Ach (%)",
-      "Total Nilai (Rp)",
-      "Outlet Aktif",
+      "Total Penjualan (Rp)",
+      "Outlet Aktif Saat Ini",
     ];
 
-    const rows = safeItems.map((s) => [
+    const rows = filteredSales.map((s) => [
       `"${s.name || ""}"`,
       `"${s.code || s.salesman_id || ""}"`,
       `"${s.area || ""}"`,
       `"${s.office_name || ""}"`,
-      `"${STATUS_LABEL[s.status] || s.status || ""}"`,
+      `"${STATUS_CONFIG[s.status]?.label || s.status || ""}"`,
       `"${s.check_in_time ? fmtTime(s.check_in_time) : "-"}"`,
+      `"${s.check_out_time ? fmtTime(s.check_out_time) : "-"}"`,
+      `"${s.work_duration_formatted || "-"}"`,
       s.planned || 0,
       s.outlet_calls || s.actual || 0,
       s.effective_calls || s.effective || 0,
@@ -452,7 +462,7 @@ export default function MonitoringPage() {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `Monitoring_Sales_${todayLocal()}.csv`);
+    link.setAttribute("download", `Mahameru_Monitoring_Sales_${selectedDate}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -481,32 +491,43 @@ export default function MonitoringPage() {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
         <div>
           <div className="flex items-center gap-2 flex-wrap">
-            <h2 className="font-heading text-xl font-bold text-navy">Monitoring Sales &amp; Tim Lapangan</h2>
+            <h2 className="font-heading text-xl font-bold text-navy">Monitoring Sales &amp; Radar GPS Tim</h2>
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
               </span>
-              Radar GPS Real-Time
+              Radar Live GPS
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            Pantau aktivitas panggilan, lokasi GPS, progres target volume, dan efektivitas kunjungan sales hari ini ({todayLocal()}).
+            Pantau posisi sales, rute kunjungan, progres panggilan terencana, rasio order (EC), dan target volume harian.
             Terakhir update: {lastSyncTime.toLocaleTimeString("id-ID")}.
           </p>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Interval Selector */}
+          {/* Date Picker */}
+          <div className="flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200 text-xs">
+            <Calendar size={13} className="text-slate-500" />
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="bg-transparent font-semibold text-slate-700 outline-none cursor-pointer"
+            />
+          </div>
+
+          {/* Sync Interval Selector */}
           <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
             <Clock size={13} className="text-slate-500 ml-1.5" />
             <select
               value={refreshIntervalSec}
               onChange={(e) => setRefreshIntervalSec(Number(e.target.value))}
               className="bg-transparent text-xs font-semibold text-slate-700 outline-none pr-2 cursor-pointer"
-              title="Interval Sinkronisasi Real-Time Peta & Data"
+              title="Interval Sinkronisasi Otomatis"
             >
-              <option value={5}>⚡ 5 Detik (Ultra Live Radar)</option>
+              <option value={5}>⚡ 5 Detik (Ultra Live)</option>
               <option value={10}>🟢 10 Detik (Real-Time)</option>
               <option value={30}>⏱️ 30 Detik</option>
               <option value={60}>⏲️ 60 Detik</option>
@@ -518,9 +539,9 @@ export default function MonitoringPage() {
             variant="outline"
             size="sm"
             onClick={exportToCSV}
-            className="text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            className="text-xs font-semibold text-slate-700 hover:bg-slate-50 h-8"
           >
-            <Download size={14} className="mr-1.5" /> Export CSV
+            <Download size={13} className="mr-1.5" /> Export CSV
           </Button>
 
           <Button
@@ -529,9 +550,9 @@ export default function MonitoringPage() {
             data-testid="monitoring-refresh"
             onClick={() => load(false)}
             disabled={loading}
-            className="text-xs font-semibold border-slate-300 text-navy hover:bg-slate-50"
+            className="text-xs font-semibold border-slate-300 text-navy hover:bg-slate-50 h-8"
           >
-            <RefreshCw size={14} className={`mr-1.5 ${loading ? "animate-spin" : ""}`} />
+            <RefreshCw size={13} className={`mr-1.5 ${loading ? "animate-spin" : ""}`} />
             {refreshIntervalSec > 0 ? `Sinkron (${autoRefreshSec}s)` : "Refresh"}
           </Button>
         </div>
@@ -539,9 +560,9 @@ export default function MonitoringPage() {
 
       {/* KPI Metric Summary Cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-blue-300 transition-colors">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Tim Sales</span>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Tim Lapangan</span>
             <Users size={16} className="text-blue-600" />
           </div>
           <div className="mt-1 flex items-baseline gap-1.5">
@@ -549,39 +570,39 @@ export default function MonitoringPage() {
             <span className="text-xs text-slate-400">/ {totalSalesmen} Aktif</span>
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            {totalSalesmen - activeInField} Off Duty / Belum Absen
+            {totalSalesmen - activeInField} Belum Absen / Off
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-indigo-300 transition-colors">
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Outlet Calls</span>
             <Store size={16} className="text-indigo-600" />
           </div>
           <div className="mt-1 flex items-baseline gap-1.5">
             <span className="text-xl font-bold text-indigo-700">{totalCalls}</span>
-            <span className="text-xs text-slate-400">/ {totalPlanned} Plan</span>
+            <span className="text-xs text-slate-400">/ {totalPlanned} Rencana</span>
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            Pencapaian: {totalPlanned > 0 ? Math.round((totalCalls / totalPlanned) * 100) : 0}%
+            Capaian Call: {totalPlanned > 0 ? Math.round((totalCalls / totalPlanned) * 100) : 0}%
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-emerald-300 transition-colors">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Effective Call</span>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Effective Call (EC)</span>
             <CheckCircle2 size={16} className="text-emerald-600" />
           </div>
           <div className="mt-1 flex items-baseline gap-1.5">
             <span className="text-xl font-bold text-emerald-700">{totalEC}</span>
-            <span className="text-xs text-slate-400">EC</span>
+            <span className="text-xs text-slate-400">Order Berhasil</span>
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            {totalCalls - totalEC} Non-Effective Call
+            {totalCalls - totalEC} Non-EC (Tanpa Order)
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-purple-300 transition-colors">
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">EC Rate</span>
             <TrendingUp size={16} className="text-purple-600" />
@@ -590,34 +611,34 @@ export default function MonitoringPage() {
             <span className="text-xl font-bold text-purple-700">{overallEcRate}%</span>
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            Rasio efektivitas order toko
+            Efektivitas konversi order toko
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-amber-300 transition-colors">
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Volume Qty</span>
             <ShoppingBag size={16} className="text-amber-600" />
           </div>
           <div className="mt-1 flex items-baseline gap-1.5">
             <span className="text-xl font-bold text-amber-700">{totalVol}</span>
-            <span className="text-xs text-slate-400">Qty</span>
+            <span className="text-xs text-slate-400">Pcs / Karton</span>
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            Realisasi produk terdistribusi
+            Total unit terdistribusi
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm hover:border-gold transition-colors">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Total Nilai</span>
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Total Penjualan</span>
             <Target size={16} className="text-gold-dark" />
           </div>
           <div className="mt-1 text-base font-bold text-navy truncate">
             {rupiah(totalRevenue)}
           </div>
           <div className="mt-1 text-[10px] text-slate-500 font-medium">
-            Faktur hari ini
+            Nilai faktur transaksi
           </div>
         </div>
       </div>
@@ -629,7 +650,7 @@ export default function MonitoringPage() {
             Sales, Peta &amp; Aktivitas
           </TabsTrigger>
           <TabsTrigger value="approvals" data-testid="tab-approvals" className="text-xs font-semibold relative">
-            Approval Outlet Baru
+            Approval Outlet Baru (NOO)
             {safePending.length > 0 && (
               <span className="ml-1.5 bg-red-500 text-white rounded-full px-1.5 py-0.2 text-[10px] font-bold">
                 {safePending.length}
@@ -639,15 +660,16 @@ export default function MonitoringPage() {
         </TabsList>
 
         <TabsContent value="sales" className="space-y-4">
-          {/* Map View & Live Visual Controller */}
-          <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-sm space-y-3">
+          {/* Map View Container */}
+          <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <MapPin size={16} className="text-navy" />
                 <span className="text-xs font-bold text-navy">Peta Sebaran GPS &amp; Rute Kunjungan Tim</span>
                 {selectedSalesman && (
-                  <span className="text-xs font-semibold text-gold-dark bg-gold/10 px-2 py-0.5 rounded-full">
-                    Fokus Sales: {selectedSalesman.name}
+                  <span className="text-xs font-semibold text-gold-dark bg-gold/10 px-2 py-0.5 rounded-full border border-gold/20 flex items-center gap-1">
+                    <span>Fokus:</span>
+                    <strong>{selectedSalesman.name}</strong>
                   </span>
                 )}
               </div>
@@ -683,7 +705,7 @@ export default function MonitoringPage() {
             {/* Map Legend */}
             <div className="flex gap-4 text-[11px] font-semibold text-slate-600 flex-wrap items-center pt-1 border-t border-slate-100">
               <span className="flex items-center gap-1.5">
-                <span className="w-3 h-3 rounded-full bg-navy inline-block shadow-sm" /> Kantor / Depo
+                <span className="w-3 h-3 rounded-full bg-navy inline-block shadow-sm" /> Kantor / Depo Geofence
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-3 h-3 rounded-full bg-gold inline-block shadow-sm" /> Posisi Sales Live
@@ -692,47 +714,84 @@ export default function MonitoringPage() {
                 <span className="w-3 h-3 rounded-full bg-emerald-500 inline-block shadow-sm" /> Effective Call (Order)
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-3 h-3 rounded-full bg-amber-500 inline-block shadow-sm" /> Non-EC Call
+                <span className="w-3 h-3 rounded-full bg-amber-500 inline-block shadow-sm" /> Open Call (Non-EC)
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-3 h-3 rounded-full bg-blue-500 inline-block shadow-sm" /> Sedang Dikunjungi
+                <span className="w-3 h-3 rounded-full bg-blue-500 inline-block shadow-sm" /> Kunjungan Berlangsung
               </span>
             </div>
           </div>
 
           {/* Filter Bar */}
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-            <div className="relative w-full sm:w-80">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={15} />
+          <div className="flex flex-col lg:flex-row items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+            <div className="relative w-full lg:w-72">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={14} />
               <Input
-                placeholder="Cari nama sales, kode, area, toko..."
+                placeholder="Cari sales, kode, toko..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="pl-9 h-9 text-xs"
               />
             </div>
 
-            <div className="flex items-center gap-2 w-full sm:w-auto overflow-x-auto">
-              <span className="text-xs font-semibold text-slate-500 flex items-center gap-1">
-                <Filter size={13} /> Status:
-              </span>
-              {["ALL", "ACTIVE", "VISITING", "ON_FIELD", "ON_DUTY", "OFF_DUTY"].map((st) => (
-                <Button
-                  key={st}
-                  variant={statusFilter === st ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setStatusFilter(st)}
-                  className={`h-8 text-xs font-semibold whitespace-nowrap ${
-                    statusFilter === st ? "bg-navy text-white" : "text-slate-600 hover:bg-slate-50"
-                  }`}
+            <div className="flex items-center gap-2 w-full lg:w-auto overflow-x-auto flex-wrap sm:flex-nowrap">
+              {/* Area Filter */}
+              <div className="flex items-center gap-1 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200 text-xs">
+                <span className="text-slate-400 font-semibold">Area:</span>
+                <select
+                  value={areaFilter}
+                  onChange={(e) => setAreaFilter(e.target.value)}
+                  className="bg-transparent font-semibold text-slate-700 outline-none cursor-pointer"
                 >
-                  {st === "ALL"
-                    ? "Semua"
-                    : st === "ACTIVE"
-                    ? "Aktif Lapangan"
-                    : STATUS_LABEL[st] || st}
-                </Button>
-              ))}
+                  <option value="ALL">Semua Area</option>
+                  {safeAreas.map((a) => (
+                    <option key={a._id} value={a._id}>
+                      {a.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Office Filter */}
+              <div className="flex items-center gap-1 bg-slate-50 px-2 py-1 rounded-lg border border-slate-200 text-xs">
+                <Building2 size={13} className="text-slate-400" />
+                <select
+                  value={officeFilter}
+                  onChange={(e) => setOfficeFilter(e.target.value)}
+                  className="bg-transparent font-semibold text-slate-700 outline-none cursor-pointer"
+                >
+                  <option value="ALL">Semua Depo</option>
+                  {safeOffices.map((o) => (
+                    <option key={o._id} value={o._id}>
+                      {o.office_name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Status Filter Buttons */}
+              <div className="flex items-center gap-1 overflow-x-auto">
+                {[
+                  { key: "ALL", label: "Semua" },
+                  { key: "ACTIVE", label: "Aktif Lapangan" },
+                  { key: "VISITING", label: "Sedang Visit" },
+                  { key: "ON_FIELD", label: "Di Lapangan" },
+                  { key: "ON_DUTY", label: "Standby Depo" },
+                  { key: "OFF_DUTY", label: "Off Duty" },
+                ].map((st) => (
+                  <Button
+                    key={st.key}
+                    variant={statusFilter === st.key ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => setStatusFilter(st.key)}
+                    className={`h-8 text-xs font-semibold whitespace-nowrap px-2.5 ${
+                      statusFilter === st.key ? "bg-navy text-white" : "text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {st.label}
+                  </Button>
+                ))}
+              </div>
             </div>
           </div>
 
@@ -741,10 +800,11 @@ export default function MonitoringPage() {
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
-                  <TableRow className="bg-slate-50 border-b border-slate-200">
+                  <TableRow className="bg-slate-50/80 border-b border-slate-200">
                     {[
                       "Petugas Sales",
                       "Status Live",
+                      "Lokasi GPS Terakhir",
                       "Plan Call",
                       "Outlet Call",
                       "Effective (EC)",
@@ -752,8 +812,8 @@ export default function MonitoringPage() {
                       "Target Vol",
                       "Actual Vol",
                       "Ach %",
-                      "Total Nilai (Rp)",
-                      "Absen Masuk",
+                      "Penjualan (Rp)",
+                      "Absensi",
                       "Aksi",
                     ].map((h) => (
                       <TableHead key={h} className="text-xs font-bold uppercase tracking-wider text-slate-600 whitespace-nowrap py-3">
@@ -765,88 +825,163 @@ export default function MonitoringPage() {
                 <TableBody>
                   {filteredSales.map((s, i) => {
                     const sm = s.summary || {};
-                    const isSelected = selectedSalesman?.salesman_id === s.salesman_id;
+                    const isSelected = selectedSalesman?.salesman_id === s.salesman_id || selectedSalesman?._id === s._id;
+                    const loc = s.last_location;
+
                     return (
                       <TableRow
-                        key={`sales-${s.salesman_id || s._id || i}`}
+                        key={`sales-mon-${s.salesman_id || s._id || i}`}
                         data-testid={`sales-row-${i}`}
-                        className={`hover:bg-slate-50/80 transition-colors cursor-pointer ${
-                          isSelected ? "bg-blue-50/60" : ""
+                        className={`hover:bg-slate-50/90 transition-colors cursor-pointer ${
+                          isSelected ? "bg-blue-50/70 border-l-4 border-l-navy" : ""
                         }`}
                         onClick={() => handleSelectSalesmanRow(s)}
                       >
+                        {/* Sales Name & Identity */}
                         <TableCell className="py-3">
-                          <div className="font-bold text-navy text-sm">{s.name}</div>
-                          <div className="text-[11px] text-slate-500 font-medium flex items-center gap-1.5 mt-0.5">
+                          <div className="font-bold text-navy text-sm flex items-center gap-1.5">
+                            <span>{s.name}</span>
+                            {s.phone && (
+                              <a
+                                href={`https://wa.me/${s.phone.replace(/^0/, "62").replace(/[^0-9]/g, "")}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-emerald-600 hover:text-emerald-700 p-0.5"
+                                title="Chat WhatsApp Sales"
+                              >
+                                <Phone size={12} />
+                              </a>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-500 font-medium flex items-center gap-1 mt-0.5">
                             <span>{s.area || "Area -"}</span>
                             <span>•</span>
                             <span>{s.office_name || "Depo Pusat"}</span>
                           </div>
                           <div className="text-[10px] text-slate-400 font-mono mt-0.5">
                             {s.code || s.salesman_id}
-                            {s.active_outlet && (
-                              <span className="text-blue-600 font-semibold ml-1">@ {s.active_outlet}</span>
-                            )}
                           </div>
                         </TableCell>
 
+                        {/* Status Live */}
                         <TableCell>
-                          <StatusBadge status={s.status || "OFF_DUTY"} label={STATUS_LABEL[s.status] || "Off Duty"} />
+                          <span
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold border ${
+                              STATUS_CONFIG[s.status]?.color || "bg-slate-100 text-slate-700 border-slate-300"
+                            }`}
+                          >
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full ${
+                                s.status === "VISITING"
+                                  ? "bg-emerald-500 animate-ping"
+                                  : s.status === "ON_FIELD"
+                                  ? "bg-amber-500"
+                                  : s.status === "ON_DUTY"
+                                  ? "bg-blue-500"
+                                  : "bg-slate-400"
+                              }`}
+                            />
+                            {STATUS_CONFIG[s.status]?.label || s.status}
+                          </span>
                         </TableCell>
 
+                        {/* Last GPS Location */}
+                        <TableCell className="max-w-xs">
+                          {s.active_outlet ? (
+                            <div className="space-y-0.5">
+                              <div className="font-bold text-blue-700 text-xs flex items-center gap-1">
+                                <Store size={12} />
+                                <span className="truncate">{s.active_outlet}</span>
+                              </div>
+                              <div className="text-[10px] text-slate-400">Sedang kunjungan toko</div>
+                            </div>
+                          ) : loc?.lat ? (
+                            <div className="space-y-0.5">
+                              <div className="text-xs font-semibold text-slate-700 flex items-center gap-1">
+                                <Navigation size={11} className="text-slate-400" />
+                                <span>{loc.lat.toFixed(4)}, {loc.lng.toFixed(4)}</span>
+                              </div>
+                              <div className="text-[10px] text-slate-400 flex items-center gap-1">
+                                <span>Sumber: {loc.source || "GPS"}</span>
+                                {loc.battery && <span>• 🔋{loc.battery}%</span>}
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400 text-xs">Belum ada sinyal</span>
+                          )}
+                        </TableCell>
+
+                        {/* Planned Calls */}
                         <TableCell className="font-semibold text-slate-700">
                           {sm.planned ?? s.planned ?? 0}
                         </TableCell>
 
+                        {/* Outlet Calls */}
                         <TableCell className="font-bold text-blue-600">
                           {sm.outlet_calls ?? sm.actual ?? s.actual ?? 0}
                         </TableCell>
 
+                        {/* Effective Calls */}
                         <TableCell className="text-emerald-600 font-bold">
                           {sm.effective_calls ?? sm.effective ?? s.effective ?? 0}
                         </TableCell>
 
+                        {/* EC Rate */}
                         <TableCell className="text-purple-600 font-bold">
                           {sm.ec_rate ?? sm.effective_ratio ?? s.ec_rate ?? 0}%
                         </TableCell>
 
+                        {/* Target Volume */}
                         <TableCell className="text-slate-600 font-semibold">
                           {s.target_volume ? `${s.target_volume} Qty` : "-"}
                         </TableCell>
 
-                        <TableCell className="text-emerald-700 font-bold">
+                        {/* Actual Volume */}
+                        <TableCell className="text-amber-700 font-bold">
                           {sm.total_volume ?? sm.volume ?? s.volume ?? 0} Qty
                         </TableCell>
 
+                        {/* Ach % */}
                         <TableCell>
                           <span
                             className={`px-2 py-0.5 rounded text-[11px] font-bold ${
                               (s.achievement_percentage || 0) >= 100
-                                ? "bg-emerald-100 text-emerald-800"
+                                ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
                                 : (s.achievement_percentage || 0) >= 75
-                                ? "bg-gold/20 text-gold-dark"
-                                : "bg-blue-50 text-blue-700"
+                                ? "bg-gold/20 text-gold-dark border border-gold/30"
+                                : "bg-blue-50 text-blue-700 border border-blue-200"
                             }`}
                           >
                             {s.achievement_formatted || (s.target_volume ? `${s.achievement_percentage}%` : "-")}
                           </span>
                         </TableCell>
 
-                        <TableCell className="font-bold text-navy">
+                        {/* Sales Revenue */}
+                        <TableCell className="font-bold text-navy whitespace-nowrap">
                           {rupiah(sm.sales_value ?? s.sales_value ?? 0)}
                         </TableCell>
 
+                        {/* Attendance Time */}
                         <TableCell className="text-xs text-slate-600 whitespace-nowrap">
                           {s.check_in_time ? (
-                            <div className="flex items-center gap-1">
-                              <Clock size={12} className="text-slate-400" />
-                              <span>{fmtTime(s.check_in_time)}</span>
+                            <div className="space-y-0.5">
+                              <div className="flex items-center gap-1 font-medium text-slate-700">
+                                <Clock size={11} className="text-emerald-600" />
+                                <span>{fmtTime(s.check_in_time)}</span>
+                              </div>
+                              {s.check_out_time && (
+                                <div className="text-[10px] text-slate-400">
+                                  Pulang: {fmtTime(s.check_out_time)}
+                                </div>
+                              )}
                             </div>
                           ) : (
-                            <span className="text-slate-400">-</span>
+                            <span className="text-slate-400 text-xs">Belum Absen</span>
                           )}
                         </TableCell>
 
+                        {/* Actions */}
                         <TableCell>
                           <Button
                             variant="outline"
@@ -855,9 +990,9 @@ export default function MonitoringPage() {
                               e.stopPropagation();
                               setSelectedSalesman(s);
                             }}
-                            className="h-7 px-2 text-xs font-semibold text-navy hover:bg-navy hover:text-white"
+                            className="h-7 px-2.5 text-xs font-semibold text-navy hover:bg-navy hover:text-white"
                           >
-                            <Eye size={12} className="mr-1" /> Detail
+                            <Eye size={12} className="mr-1" /> Rincian
                           </Button>
                         </TableCell>
                       </TableRow>
@@ -866,7 +1001,7 @@ export default function MonitoringPage() {
 
                   {filteredSales.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={12} className="text-center py-12 text-slate-400 text-sm">
+                      <TableCell colSpan={13} className="text-center py-12 text-slate-400 text-sm">
                         Tidak ada data sales yang cocok dengan kriteria filter.
                       </TableCell>
                     </TableRow>
@@ -886,7 +1021,7 @@ export default function MonitoringPage() {
             >
               <CheckCircle2 size={36} className="mx-auto text-emerald-500/80" />
               <div className="font-bold text-slate-700">Semua Outlet Telah Disetujui</div>
-              <p className="text-xs text-slate-400">Tidak ada pengajuan outlet baru yang menunggu persetujuan.</p>
+              <p className="text-xs text-slate-400">Tidak ada pengajuan outlet baru (NOO) yang menunggu persetujuan supervisor.</p>
             </div>
           )}
 
@@ -947,17 +1082,20 @@ export default function MonitoringPage() {
         </TabsContent>
       </Tabs>
 
-      {/* Salesman Detail Activity Trail Modal */}
+      {/* Salesman Detail Activity Modal */}
       {selectedSalesman && (
         <Dialog open={!!selectedSalesman} onOpenChange={(open) => !open && setSelectedSalesman(null)}>
           <DialogContent className="max-w-2xl max-h-[88vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle className="text-lg font-bold text-navy flex items-center justify-between">
                 <span>Rincian Aktivitas: {selectedSalesman.name}</span>
-                <StatusBadge
-                  status={selectedSalesman.status || "OFF_DUTY"}
-                  label={STATUS_LABEL[selectedSalesman.status] || "Off Duty"}
-                />
+                <span
+                  className={`px-2.5 py-0.5 rounded-full text-xs font-bold border ${
+                    STATUS_CONFIG[selectedSalesman.status]?.color || "bg-slate-100 text-slate-700"
+                  }`}
+                >
+                  {STATUS_CONFIG[selectedSalesman.status]?.label || selectedSalesman.status}
+                </span>
               </DialogTitle>
               <DialogDescription className="text-xs text-slate-500">
                 Area: {selectedSalesman.area || "-"} · Kantor: {selectedSalesman.office_name || "Depo Pusat"} · Kode: {selectedSalesman.code || selectedSalesman.salesman_id}
@@ -993,18 +1131,56 @@ export default function MonitoringPage() {
                 </div>
               </div>
 
-              {/* Contact & Attendance */}
+              {/* Call Plan Progress Compliance */}
+              {selectedSalesman.call_plan && (
+                <div className="p-3 bg-indigo-50/60 rounded-xl border border-indigo-100 space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-bold text-indigo-900">Kepatuhan Rencana Kunjungan (Call Plan)</span>
+                    <span className="font-bold text-indigo-700">
+                      {selectedSalesman.call_plan.compliance_percentage}% Selesai
+                    </span>
+                  </div>
+                  <div className="w-full bg-indigo-200 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-indigo-600 h-full rounded-full transition-all"
+                      style={{ width: `${selectedSalesman.call_plan.compliance_percentage}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-[11px] text-indigo-800">
+                    <span>Terencana: {selectedSalesman.call_plan.planned} Toko</span>
+                    <span>Telah Dikunjungi: {selectedSalesman.call_plan.visited} Toko</span>
+                    <span>Sisa: {selectedSalesman.call_plan.pending} Toko</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Contact & Attendance Details */}
               <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-blue-50/60 rounded-xl border border-blue-100 text-xs">
                 <div className="space-y-1">
                   <div className="font-semibold text-slate-700 flex items-center gap-1.5">
                     <Clock size={13} className="text-blue-600" />
                     <span>
-                      Absensi Masuk: {selectedSalesman.check_in_time ? fmtDateTime(selectedSalesman.check_in_time) : "Belum Absen"}
+                      Absensi: {selectedSalesman.check_in_time ? fmtTime(selectedSalesman.check_in_time) : "Belum Masuk"}
+                      {selectedSalesman.check_out_time ? ` - Pulang: ${fmtTime(selectedSalesman.check_out_time)}` : ""}
                     </span>
                   </div>
                   {selectedSalesman.active_outlet && (
                     <div className="text-blue-700 font-bold flex items-center gap-1">
-                      <Store size={13} /> Sedang di outlet: {selectedSalesman.active_outlet}
+                      <Store size={13} /> Sedang di toko: {selectedSalesman.active_outlet}
+                    </div>
+                  )}
+                  {selectedSalesman.last_location?.lat && (
+                    <div className="text-slate-500 text-[11px] flex items-center gap-1">
+                      <MapPin size={12} className="text-slate-400" />
+                      <span>GPS: {selectedSalesman.last_location.lat.toFixed(5)}, {selectedSalesman.last_location.lng.toFixed(5)}</span>
+                      <a
+                        href={`https://www.google.com/maps?q=${selectedSalesman.last_location.lat},${selectedSalesman.last_location.lng}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 font-semibold underline ml-1"
+                      >
+                        Buka Maps
+                      </a>
                     </div>
                   )}
                 </div>
@@ -1016,7 +1192,7 @@ export default function MonitoringPage() {
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg font-bold text-xs transition-colors"
                   >
-                    <Phone size={13} /> Hubungi WhatsApp
+                    <Phone size={13} /> Chat WhatsApp
                   </a>
                 )}
               </div>
@@ -1051,7 +1227,8 @@ export default function MonitoringPage() {
                         <div className="text-[10px] text-slate-400 pl-6 flex items-center gap-2">
                           <span>Waktu: {fmtTime(v.check_in_time)}</span>
                           {v.check_out_time && <span>- {fmtTime(v.check_out_time)}</span>}
-                          {v.distance_m != null && <span>• Jarak GPS: {v.distance_m}m</span>}
+                          {v.duration_minutes > 0 && <span>• Durasi: {v.duration_minutes}m</span>}
+                          {v.distance_m != null && <span>• Jarak: {v.distance_m}m</span>}
                         </div>
                       </div>
 
@@ -1063,7 +1240,7 @@ export default function MonitoringPage() {
                               : "bg-amber-100 text-amber-800"
                           }`}
                         >
-                          {v.call_result === "EFFECTIVE" ? "Effective Call" : "Non-EC Call"}
+                          {v.call_result === "EFFECTIVE" ? "Effective Call (EC)" : "Non-EC Call"}
                         </span>
                         {v.revenue > 0 && (
                           <div className="font-bold text-navy text-xs">{rupiah(v.revenue)}</div>
